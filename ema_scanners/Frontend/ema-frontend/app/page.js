@@ -887,7 +887,7 @@ function BacktestPage({ scanRow, initialMarket, onBack }) {
 
       {/* Stat cards */}
       {!loading && !error && trades && (
-        <div style={{ display:"flex", gap:12, padding:"16px 24px", borderBottom:"1px solid #e8eaed", flexWrap:"wrap" }}>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(8,1fr)", gap:12, padding:"16px 24px", borderBottom:"1px solid #e8eaed" }}>
           <StatCard label="Total Trades" value={allTradesCount}/>
           <StatCard label="Open"         value={openCount} color="#0891b2"/>
           <StatCard label="Wins"         value={wins}   color="#16a34a"/>
