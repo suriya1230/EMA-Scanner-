@@ -30,6 +30,7 @@ from app.services.ema_engine import EMAEngine
 from app.services.market_data_collector import MarketDataCollector, CANDLE_RETENTION as BACKTEST_INTERVALS
 from app.services.repository import CandleRepository, SignalRepository
 from app.services.backfill import HistoricalBackfill
+from app.services.signal_score import compute_score, higher_tf_agreement
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ class SymbolState:
     last_signal_type:  str | None    = None
     last_cross_price:  float | None  = None
     last_signal_time:  object | None = None   # datetime | None
-    score: float = 0.0   # 0-100 — see ScannerService._compute_score
+    score: float = 0.0   # 0-100, frozen at signal-detection time — see signal_score.py
 
 
 class ScannerService:
@@ -199,14 +200,33 @@ class ScannerService:
             info = tickers.get(symbol, {})
             sig = sig_map.get(symbol)
             change_1h = ((closes[-1] - closes[-2]) / closes[-2] * 100) if len(closes) >= 2 and closes[-2] != 0 else 0.0
-            score = await self._compute_score(
-                symbol=symbol, price=float(closes[-1]),
-                ema7=float(ema7[-1]), ema25=float(ema25[-1]), ema99=float(ema99[-1]),
-                highs=highs, lows=lows, closes=closes,
-                last_signal_type=sig.signal_type if sig else None,
-                change_1h=float(change_1h), change_24h=info.get("change_24h", 0.0),
-                volume_24h=info.get("volume_24h", 0.0),
-            )
+
+            # Score is frozen at signal-detection time (see signal_score.py)
+            # and never recomputed against today's live data — just read
+            # whatever was stored with the signal. Older rows from before
+            # the `score` column existed get computed once here, using the
+            # candle AS OF THAT SIGNAL'S OWN cross_time (not "now"), then
+            # persisted so this lazy path only ever runs once per row.
+            score = 0.0
+            if sig is not None:
+                if sig.score is not None:
+                    score = sig.score
+                else:
+                    volumes = np.array([c.volume for c in candles], dtype=float)
+                    cross_time_ms = int(sig.cross_time.timestamp() * 1000)
+                    idx = next(
+                        (i for i in range(len(candles)) if candles[i].open_time <= cross_time_ms < candles[i].open_time + 3_600_000),
+                        len(candles) - 1,
+                    )
+                    direction = 1 if sig.signal_type == "BUY" else -1
+                    agree = await higher_tf_agreement(symbol, self._market, cross_time_ms, direction, self._engine)
+                    score = compute_score(
+                        closes, highs, lows, volumes, ema7, ema25, ema99,
+                        idx, sig.signal_type, agree, self._engine,
+                    )
+                    async with AsyncSessionLocal() as session:
+                        await SignalRepository.set_signal_score(session, sig.id, score)
+                        await session.commit()
 
             self._states[symbol] = SymbolState(
                 symbol=symbol,
@@ -222,90 +242,6 @@ class ScannerService:
                 last_signal_time=sig.cross_time if sig else None,
                 score=score,
             )
-
-    # ── Signal Score (0-100) ─────────────────────────────────────────────────
-    #
-    # Grades the coin's LAST SIGNAL (not the current live trend) — "how
-    # strong/still-valid does that BUY or SELL signal look right now, given
-    # what price has done since." No last signal at all -> nothing to grade -> 0.
-    # Weighted blend of six factors, each already backed by real stored data
-    # (no fabricated inputs):
-    #   20% EMA separation   — |EMA7-EMA99| as % of price; wider = more decisive trend
-    #   20% Higher-TF agree  — does the 4H/6H trend agree with the signal's direction
-    #   15% Momentum         — does 1H/24H price change agree with the signal's direction
-    #   15% Volatility (ATR) — EMA separation relative to normal 1H noise (ATR14)
-    #   15% Volume           — 24H volume as a liquidity proxy
-    #   15% Distance/EMA99   — how extended price is from EMA99 (fresh vs exhausted)
-    # If price has since reversed against the signal, momentum/higher-TF
-    # agreement naturally score low — this is what lets Score fall over time
-    # even without a new opposite signal firing.
-
-    HIGHER_TF_INTERVALS = ("4h", "6h")
-
-    async def _compute_score(
-        self, symbol: str, price: float, ema7: float, ema25: float, ema99: float,
-        highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, last_signal_type: str | None,
-        change_1h: float, change_24h: float, volume_24h: float,
-    ) -> float:
-        if not last_signal_type or price <= 0:
-            return 0.0
-        direction = 1 if last_signal_type == "BUY" else -1
-
-        ema_sep_pct = abs(ema7 - ema99) / price * 100
-        ema_sep_score = min(100.0, (ema_sep_pct / 3.0) * 100)
-
-        atr = self._engine.compute_atr(highs, lows, closes)
-        atr_pct = (atr / price * 100) if price > 0 else 0.0
-        volatility_score = 50.0 if atr_pct <= 0 else min(100.0, (ema_sep_pct / atr_pct) * 50)
-
-        avg_change = (change_1h + change_24h) / 2
-        momentum_score = max(0.0, min(100.0, 50 + (avg_change * direction) * 10))
-
-        agree_count = await self._higher_tf_agreement(symbol, direction)
-        higher_tf_score = agree_count * 50.0
-
-        if volume_24h <= settings.MIN_VOLUME_USDT_SIGNAL:
-            volume_score = 0.0
-        else:
-            volume_score = min(100.0, (volume_24h - settings.MIN_VOLUME_USDT_SIGNAL)
-                                / (200_000_000 - settings.MIN_VOLUME_USDT_SIGNAL) * 100)
-
-        dist_pct = abs(price - ema99) / ema99 * 100 if ema99 > 0 else 0.0
-        if dist_pct < 0.2:
-            distance_score = (dist_pct / 0.2) * 60
-        elif dist_pct <= 2.0:
-            distance_score = 100.0
-        elif dist_pct >= 6.0:
-            distance_score = 0.0
-        else:
-            distance_score = 100 - (dist_pct - 2.0) / (6.0 - 2.0) * 100
-
-        score = (
-            0.20 * ema_sep_score +
-            0.20 * higher_tf_score +
-            0.15 * momentum_score +
-            0.15 * volatility_score +
-            0.15 * volume_score +
-            0.15 * distance_score
-        )
-        return round(max(0.0, min(100.0, score)), 1)
-
-    async def _higher_tf_agreement(self, symbol: str, direction: int) -> int:
-        """How many of the 4H/6H trends agree with the last signal's direction (0-2)."""
-        agree = 0
-        for interval in self.HIGHER_TF_INTERVALS:
-            async with AsyncSessionLocal() as session:
-                candles = await CandleRepository.get_candles(
-                    session, symbol, interval=interval, market=self._market, limit=settings.CANDLES_LIMIT
-                )
-            if len(candles) < 2:
-                continue
-            closes = np.array([c.close for c in candles], dtype=float)
-            ema7, ema25, ema99 = self._engine.calculate_emas(closes)
-            tf_trend = self._engine.classify_trend(float(ema7[-1]), float(ema25[-1]), float(ema99[-1]))
-            if (direction == 1 and tf_trend == "Bullish") or (direction == -1 and tf_trend == "Bearish"):
-                agree += 1
-        return agree
 
     # ── Live WebSocket Candle Processing (1H only — scanner table) ──────────
     #
@@ -371,6 +307,18 @@ class ScannerService:
         if signal is None:
             return
 
+        # Score is computed ONCE, right now, at signal-detection time — using
+        # this candle's own data — and frozen onto the row. It is never
+        # recomputed later against future/live data (see signal_score.py).
+        highs   = np.array([c.high   for c in candles], dtype=float)
+        lows    = np.array([c.low    for c in candles], dtype=float)
+        volumes = np.array([c.volume for c in candles], dtype=float)
+        idx = len(candles) - 1
+        direction = 1 if signal.signal_type == "BUY" else -1
+        cross_time_ms = int(signal.cross_time.timestamp() * 1000)
+        agree = await higher_tf_agreement(symbol, self._market, cross_time_ms, direction, self._engine)
+        score = compute_score(closes, highs, lows, volumes, ema7, ema25, ema99, idx, signal.signal_type, agree, self._engine)
+
         async with AsyncSessionLocal() as session:
             stored = await SignalRepository.insert_signal(
                 session,
@@ -382,6 +330,7 @@ class ScannerService:
                 ema_25=signal.ema_25,
                 ema_99=signal.ema_99,
                 market=self._market,
+                score=score,
             )
             await session.commit()
 
@@ -392,6 +341,7 @@ class ScannerService:
             state.last_signal_type = signal.signal_type
             state.last_cross_price = signal.cross_price
             state.last_signal_time = signal.cross_time
+            state.score            = score
             logger.info(
                 "🚨 [%s] %-4s %-12s | cross_price=%-12.6f cross_time=%s | "
                 "EMA7=%.4f EMA25=%.4f EMA99=%.4f",

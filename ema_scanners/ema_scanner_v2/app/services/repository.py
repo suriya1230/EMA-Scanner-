@@ -149,6 +149,7 @@ class SignalRepository:
         ema_99: float,
         interval: str = "1h",
         market: str = "futures",
+        score: float | None = None,
     ) -> Signal | None:
         stmt = (
             pg_insert(Signal)
@@ -162,6 +163,7 @@ class SignalRepository:
                 ema_7=ema_7,
                 ema_25=ema_25,
                 ema_99=ema_99,
+                score=score,
             )
             .on_conflict_do_nothing(constraint="uq_signal_symbol_market_interval_time_type")
             .returning(Signal)
@@ -171,17 +173,30 @@ class SignalRepository:
         return row[0] if row else None
 
     @staticmethod
-    async def bulk_insert_signals(session: AsyncSession, rows: list[dict]) -> int:
-        """Each row dict must include 'market' and 'interval' keys."""
+    async def set_signal_score(session: AsyncSession, signal_id: int, score: float) -> None:
+        """Lazily backfills the frozen score for a signal that predates the
+        `score` column (or was inserted before this was wired up) — computed
+        once, on first read, then never touched again."""
+        from sqlalchemy import update
+        await session.execute(update(Signal).where(Signal.id == signal_id).values(score=score))
+
+    @staticmethod
+    async def bulk_insert_signals(session: AsyncSession, rows: list[dict]) -> list[Signal]:
+        """Each row dict must include 'market' and 'interval' keys. Returns
+        only the rows that were ACTUALLY newly inserted (ON CONFLICT DO
+        NOTHING skips ones that already existed) — callers use this to
+        compute each new signal's frozen score exactly once, never
+        recomputing it on later re-scans of the same 30-day window."""
         if not rows:
-            return 0
+            return []
         stmt = (
             pg_insert(Signal)
             .values(rows)
             .on_conflict_do_nothing(constraint="uq_signal_symbol_market_interval_time_type")
+            .returning(Signal)
         )
         result = await session.execute(stmt)
-        return result.rowcount
+        return list(result.scalars().all())
 
     @staticmethod
     async def get_last_signal(

@@ -35,6 +35,7 @@ import numpy as np
 from app.db.database import AsyncSessionLocal, init_db
 from app.services.ema_engine import EMAEngine, INTERVAL_MS, lookback_for_interval
 from app.services.repository import CandleRepository, SignalRepository
+from app.services.signal_score import compute_score, higher_tf_agreement
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,9 @@ class HistoricalBackfill:
 
         n = len(candles)
         closes     = np.array([c.close     for c in candles], dtype=float)
+        highs      = np.array([c.high      for c in candles], dtype=float)
+        lows       = np.array([c.low       for c in candles], dtype=float)
+        volumes    = np.array([c.volume    for c in candles], dtype=float)
         open_times = np.array([c.open_time for c in candles], dtype=np.int64)
 
         logger.info(
@@ -179,9 +183,33 @@ class HistoricalBackfill:
             )
 
         async with AsyncSessionLocal() as session:
-            inserted = await SignalRepository.bulk_insert_signals(session, signal_rows)
+            inserted_signals = await SignalRepository.bulk_insert_signals(session, signal_rows)
             await session.commit()
 
+        # Score is only ever shown for 1H signals (the scanner table is
+        # 1H-based — see scanner_service.py), and only for genuinely NEW
+        # insertions — ON CONFLICT DO NOTHING already means re-scanning the
+        # same 30-day window on every periodic backfill won't re-insert
+        # existing signals, so this never recomputes a score that's already
+        # frozen onto an older row.
+        if interval == "1h":
+            for sig_row in inserted_signals:
+                cross_time_ms = int(sig_row.cross_time.timestamp() * 1000)
+                idx = next(
+                    (i for i in range(n) if open_times[i] <= cross_time_ms < open_times[i] + candle_ms),
+                    n - 1,
+                )
+                direction = 1 if sig_row.signal_type == "BUY" else -1
+                agree = await higher_tf_agreement(symbol, market, cross_time_ms, direction, self._engine)
+                score = compute_score(
+                    closes, highs, lows, volumes, ema7, ema25, ema99,
+                    idx, sig_row.signal_type, agree, self._engine,
+                )
+                async with AsyncSessionLocal() as session:
+                    await SignalRepository.set_signal_score(session, sig_row.id, score)
+                    await session.commit()
+
+        inserted = len(inserted_signals)
         logger.info(
             "%s %s %s — %d crossovers found in 30 days, %d inserted (rest already existed)",
             market, symbol, interval, len(signal_events), inserted,

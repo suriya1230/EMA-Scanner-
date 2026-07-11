@@ -46,6 +46,7 @@ class Signal(Base):
     ema_7       = Column(Float,      nullable=False)
     ema_25      = Column(Float,      nullable=False)
     ema_99      = Column(Float,      nullable=False)
+    score       = Column(Float,      nullable=True)  # 0-100, frozen at detection time — see ScannerService._compute_score
     created_at  = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
