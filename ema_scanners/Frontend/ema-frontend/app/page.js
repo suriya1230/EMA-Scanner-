@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
+import { TrendingUp, TrendingDown, Target, Database, CheckCircle2, XCircle, ListChecks, Percent } from "lucide-react";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000/api";
@@ -28,22 +29,13 @@ function fmtDate(ms) {
 function fmtDateTime(ms) {
   const d = new Date(ms);
   return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }) +
-    ", " + d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false }) + " IST";
+    ", " + d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: true }) + " IST";
 }
 function fmtTime(dt) {
   if (!dt) return "—";
   const d = new Date(dt);
   return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }) +
-    ", " + d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false }) + " IST";
-}
-function symCategory(sym) {
-  const s = sym.replace("USDT", "");
-  if (s === "BTC") return "Bitcoin";
-  const stables = ["USDC","BUSD","DAI","FDUSD","TUSD","USDE","USDP"];
-  if (stables.includes(s)) return "Stables";
-  const memes = ["DOGE","SHIB","PEPE","FLOKI","BONK","WIF","MEME","BOME","NEIRO","MOODENG"];
-  if (memes.includes(s)) return "Memes";
-  return "Alts";
+    ", " + d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: true }) + " IST";
 }
 function fmtSym(sym) {
   return { base: sym.replace("USDT",""), quote: "/USDT" };
@@ -77,6 +69,35 @@ const SigBadge = ({ s }) => {
     background: s==="BUY"?"#16a34a":"#dc2626", color:"#fff"
   }}>{s}</span>;
 };
+
+const ScoreBadge = ({ v }) => {
+  const s = v ?? 0;
+  const color = s >= 70 ? "#16a34a" : s >= 40 ? "#f59e0b" : "#dc2626";
+  const bg    = s >= 70 ? "#e7f8ef" : s >= 40 ? "#fef3e2" : "#fdecec";
+  return (
+    <span style={{
+      display:"inline-block", minWidth:34, textAlign:"center", padding:"3px 10px",
+      borderRadius:6, fontSize:13, fontWeight:700, color, background:bg, border:`1px solid ${color}33`,
+    }}>{s.toFixed(0)}</span>
+  );
+};
+
+const SummaryCard = ({ label, badge, badgeBg, badgeColor, value, valueColor, bg, Icon }) => (
+  <div style={{
+    background:bg, borderRadius:16, padding:"18px 20px", border:"3px solid #fff",
+    boxShadow:"0 1px 4px rgba(0,0,0,0.05)", position:"relative", overflow:"hidden", minHeight:96,
+  }}>
+    <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+      <span style={{ fontSize:11, fontWeight:800, letterSpacing:"0.06em", color:"#374151", textTransform:"uppercase" }}>{label}</span>
+      <span style={{
+        fontSize:10, fontWeight:700, padding:"2px 9px", borderRadius:999,
+        background:badgeBg, color:badgeColor, whiteSpace:"nowrap",
+      }}>{badge}</span>
+    </div>
+    <div style={{ fontSize:30, fontWeight:800, color:valueColor, marginTop:8 }}>{value}</div>
+    <Icon size={30} strokeWidth={2} style={{ position:"absolute", right:16, bottom:14, opacity:0.5, color:valueColor }}/>
+  </div>
+);
 
 const ChgCell = ({ v }) => (
   <span style={{ color: v>=0?"#16a34a":"#dc2626", fontWeight:500 }}>
@@ -247,33 +268,41 @@ function runBacktestFromSignals(candles, dbSignals, rrMode, windowDays, candleMs
 }
 
 
-const CATS  = ["All","Bitcoin","Alts","Memes","Stables"];
 const SIGS  = ["All","BUY","SELL"];
+const BT_PERIOD_DAYS = { day: 1, week: 7, month: 30 };
 const SCOLS = [
   {k:"rank",     l:"#",            s:true},
   {k:"symbol",   l:"Symbol",       s:true},
   {k:"ema_trend",l:"EMA Trend",    s:true},
+  {k:"score",    l:"Score",        s:true,  r:true},
   {k:"price",    l:"Price",        s:true,  r:true},
-  {k:"change_24h",l:"24H Change",  s:true,  r:true},
+  {k:"change_1h",l:"1H %",         s:true,  r:true},
+  {k:"change_24h",l:"24H %",       s:true,  r:true},
   {k:"volume_24h",l:"Volume (24H)",s:true,  r:true},
   {k:"last_signal",l:"Last Signal",s:true},
-  {k:"cross_price",l:"Cross Price",s:false, r:true},
   {k:"signal_time",l:"Signal Time",s:true},
   {k:"details",  l:"Details",      s:false},
 ];
 
-function ScannerPage({ market, setMarket, onDetails, onBacktest }) {
+function ScannerPage({ market, setMarket, onDetails, onBacktest, onScreenerBacktest }) {
   const [rows, setRows] = useState([]);
   const [status, setStatus] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [cat, setCat] = useState("All");
   const [sig, setSig] = useState("All");
+  const [trend, setTrend] = useState("All");
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState({ k:"signal_time", dir:"desc" });
   const [modal, setModal] = useState(null);
   const [updated, setUpdated] = useState(null);
+  const [nowTick, setNowTick] = useState(null);
   const intRef = useRef(null);
+
+  useEffect(() => {
+    const id = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const scannedAgoSec = (updated && nowTick) ? Math.max(0, Math.floor((nowTick - updated.getTime()) / 1000)) : null;
 
   const fetchData = useCallback(async () => {
     try {
@@ -303,7 +332,7 @@ function ScannerPage({ market, setMarket, onDetails, onBacktest }) {
 
   const filtered = rows
     .filter(r => {
-      if (cat !== "All" && symCategory(r.symbol) !== cat) return false;
+      if (trend !== "All" && r.ema_trend !== trend) return false;
       if (search && !r.symbol.toLowerCase().includes(search.toLowerCase())) return false;
       return true;
     })
@@ -317,74 +346,117 @@ function ScannerPage({ market, setMarket, onDetails, onBacktest }) {
 
   const toggleSort = k => setSort(s => s.k===k ? {k, dir:s.dir==="asc"?"desc":"asc"} : {k, dir:"desc"});
 
+  const bullishCount = rows.filter(r => r.ema_trend === "Bullish").length;
+  const bearishCount = rows.filter(r => r.ema_trend === "Bearish").length;
+  const scoredRows = rows.filter(r => r.last_signal);
+  const avgScore = scoredRows.length
+    ? Math.round(scoredRows.reduce((s, r) => s + (r.score || 0), 0) / scoredRows.length)
+    : 0;
+
   return (
-    <div style={{ fontFamily:"'Inter',system-ui,sans-serif", background:"#fff", minHeight:"100vh", width:"100%", color:"#111827" }}>
+    <div style={{ fontFamily:"'Inter',system-ui,sans-serif", background:"#f5f6f8", minHeight:"100vh", width:"100%", color:"#111827" }}>
       {/* Header */}
-      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"14px 24px", borderBottom:"1px solid #e8eaed" }}>
-        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-          <div style={{ width:36, height:36, borderRadius:8, background:"#f59e0b", display:"flex", alignItems:"center", justifyContent:"center", fontSize:18, color:"#fff", fontWeight:700 }}>⚡</div>
-          <div>
-            <div style={{ fontSize:17, fontWeight:700, letterSpacing:"-0.01em" }}>EMA Scanner</div>
-            <div style={{ fontSize:11, color:"#9ca3af" }}>Binance {market === "spot" ? "Spot" : "USDT Futures"} · EMA 7/25/99</div>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"20px 24px 16px", flexWrap:"wrap", gap:12 }}>
+        <div>
+          <div style={{ fontSize:26, fontWeight:800, letterSpacing:"-0.02em" }}>EMA SCANNER</div>
+          <div style={{ fontSize:12, color:"#9ca3af", fontWeight:600, marginTop:2, letterSpacing:"0.02em" }}>
+            TRIPLE EMA STRATEGY 7 › 25 › 99 · Binance {market === "spot" ? "Spot" : "USDT Futures"}
           </div>
         </div>
-        <div style={{ display:"flex", alignItems:"center", gap:16 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:14, flexWrap:"wrap" }}>
           <MarketToggle market={market} setMarket={setMarket} />
-          {updated && <span style={{ fontSize:11, color:"#9ca3af" }}>Updated {updated.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false})}</span>}
-          <button onClick={fetchData} style={{ padding:"6px 14px", borderRadius:8, border:"1px solid #e5e7eb", background:"transparent", fontSize:12, color:"#374151", cursor:"pointer", fontWeight:500 }}>↻ Refresh</button>
+          {status && (
+            <span style={{ display:"flex", alignItems:"center", gap:6, fontSize:12, color:"#6b7280", fontWeight:500 }}>
+              <span style={{ width:7, height:7, borderRadius:"50%", background:status.status==="ready"?"#22c55e":"#f59e0b", display:"inline-block" }}/>
+              {status.status === "ready"
+                ? (scannedAgoSec != null ? `Scanned ${scannedAgoSec}s ago` : "Live")
+                : "Initializing"}
+            </span>
+          )}
+          <button onClick={fetchData} title="Refresh" style={{
+            width:32, height:32, borderRadius:8, border:"1px solid #e5e7eb", background:"#fff",
+            fontSize:15, color:"#374151", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center",
+          }}>↻</button>
         </div>
       </div>
 
-      {/* Status bar */}
-      {status && (
-        <div style={{ display:"flex", gap:24, padding:"9px 24px", background:"#f8f9fb", borderBottom:"1px solid #e8eaed", fontSize:12, color:"#6b7280", alignItems:"center" }}>
-          <span style={{ display:"flex", alignItems:"center", gap:6 }}>
-            <span style={{ width:7, height:7, borderRadius:"50%", background:status.status==="ready"?"#22c55e":"#f59e0b", display:"inline-block" }}/>
-            {status.status === "ready" ? "Live" : "Initializing"}
-          </span>
-          <span>Tracking <strong>{status.symbols_tracked}</strong> symbols</span>
-          <span>Signals today: <strong>{status.signals_today}</strong></span>
-          <span>Uptime: <strong>{Math.floor(status.uptime_seconds/60)}m</strong></span>
-        </div>
-      )}
+      {/* Summary cards */}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))", gap:16, padding:"0 24px 16px" }}>
+        <SummaryCard
+          label="Bullish" badge="7›25›99" badgeBg="#bbf1d3" badgeColor="#166534"
+          value={bullishCount} valueColor="#16a34a" bg="#e7f8ef" Icon={TrendingUp}
+        />
+        <SummaryCard
+          label="Bearish" badge="99›25›7" badgeBg="#fbcfd1" badgeColor="#991b1b"
+          value={bearishCount} valueColor="#dc2626" bg="#fdecec" Icon={TrendingDown}
+        />
+        <SummaryCard
+          label="Avg Score" badge="AVG" badgeBg="#111827" badgeColor="#fff"
+          value={avgScore} valueColor="#111827" bg="#e7e7fb" Icon={Target}
+        />
+        <SummaryCard
+          label="Stored" badge="TOTAL" badgeBg="#fcd9a8" badgeColor="#9a5b13"
+          value={status?.symbols_tracked ?? rows.length} valueColor="#f59e0b" bg="#fdf1e2" Icon={Database}
+        />
+      </div>
 
-      {/* Filters */}
-      <div style={{ padding:"12px 24px", borderBottom:"1px solid #e8eaed" }}>
-        <div style={{ display:"flex", alignItems:"center", gap:12, flexWrap:"wrap" }}>
-          <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Category</span>
-          <div style={{ display:"flex", gap:4 }}>
-            {CATS.map(c => (
-              <button key={c} onClick={()=>setCat(c)} style={{
-                padding:"4px 12px", borderRadius:6, fontSize:12, fontWeight:500, cursor:"pointer",
-                border:cat===c?"1.5px solid #f59e0b":"1px solid #e5e7eb", background:"transparent",
-                color:cat===c?"#f59e0b":"#6b7280",
-              }}>{c}</button>
-            ))}
-          </div>
-          <div style={{ width:1, height:20, background:"#e5e7eb" }}/>
-          <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Signal</span>
-          <div style={{ display:"flex", gap:4 }}>
-            {SIGS.map(s => (
-              <button key={s} onClick={()=>setSig(s)} style={{
-                padding:"4px 12px", borderRadius:6, fontSize:12, fontWeight:500, cursor:"pointer",
-                border:sig===s?"1.5px solid #f59e0b":"1px solid #e5e7eb", background:"transparent",
-                color:sig===s?"#f59e0b":"#6b7280",
-              }}>{s}</button>
-            ))}
-          </div>
-          <div style={{ marginLeft:"auto" }}>
-            <input placeholder="Search…" value={search} onChange={e=>setSearch(e.target.value)} style={{
-              padding:"6px 12px", borderRadius:8, border:"1px solid #e5e7eb", fontSize:13,
-              color:"#374151", outline:"none", width:180, background:"#fafafa",
-            }}/>
-          </div>
+      {/* Search */}
+      <div style={{ padding:"0 24px 12px" }}>
+        <div style={{ position:"relative", maxWidth:260 }}>
+          <span style={{ position:"absolute", left:14, top:"50%", transform:"translateY(-50%)", color:"#9ca3af", fontSize:13 }}>⌕</span>
+          <input placeholder="Search coins…" value={search} onChange={e=>setSearch(e.target.value)} style={{
+            width:"100%", padding:"9px 14px 9px 32px", borderRadius:10, border:"1px solid #e5e7eb", fontSize:13,
+            color:"#374151", outline:"none", background:"#fff", boxSizing:"border-box",
+          }}/>
         </div>
         <div style={{ marginTop:8, fontSize:12, color:"#9ca3af" }}>
-          Showing <strong style={{ color:"#374151" }}>{filtered.length}</strong> coins
+          <strong style={{ color:"#374151" }}>{filtered.length}</strong> entries
+          {status && <> · Signals today: <strong style={{ color:"#374151" }}>{status.signals_today}</strong> · Uptime: <strong style={{ color:"#374151" }}>{Math.floor(status.uptime_seconds/60)}m</strong></>}
+        </div>
+      </div>
+
+      {/* Filters */}
+      <div style={{ padding:"16px 24px", display:"flex", alignItems:"center", gap:16, flexWrap:"wrap", borderTop:"1px solid #e5e7eb", borderBottom:"1px solid #e5e7eb" }}>
+        <div style={{ display:"flex", gap:4 }}>
+          {["All","Bullish","Bearish"].map(t => (
+            <button key={t} onClick={()=>setTrend(t)} style={{
+              padding:"6px 16px", borderRadius:8, fontSize:12, fontWeight:700, cursor:"pointer",
+              border: trend===t ? "1px solid #111827" : "1px solid #e5e7eb",
+              background: trend===t ? "#111827" : "#fff",
+              color: trend===t ? "#fff" : "#6b7280", textTransform:"uppercase",
+            }}>{t}</button>
+          ))}
+        </div>
+        <div style={{ width:1, height:20, background:"#e5e7eb" }}/>
+        <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Signal</span>
+        <div style={{ display:"flex", gap:4 }}>
+          {SIGS.map(s => (
+            <button key={s} onClick={()=>setSig(s)} style={{
+              padding:"5px 13px", borderRadius:7, fontSize:12, fontWeight:600, cursor:"pointer",
+              border:sig===s?"1.5px solid #f59e0b":"1px solid #e5e7eb", background:sig===s?"#fff7ed":"#fff",
+              color:sig===s?"#f59e0b":"#6b7280",
+            }}>{s}</button>
+          ))}
+        </div>
+        <div style={{ marginLeft:"auto", display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+          <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Sort</span>
+          {[["signal_time","Time"],["score","Score"],["volume_24h","Vol"],["change_24h","24H %"]].map(([k,l]) => (
+            <button key={k} onClick={()=>toggleSort(k)} style={{
+              padding:"5px 13px", borderRadius:7, fontSize:12, fontWeight:600, cursor:"pointer",
+              border:sort.k===k?"1.5px solid #6366f1":"1px solid #e5e7eb", background:sort.k===k?"#eef2ff":"#fff",
+              color:sort.k===k?"#6366f1":"#6b7280",
+            }}>{l}{sort.k===k ? (sort.dir==="asc"?" ↑":" ↓") : ""}</button>
+          ))}
+          <div style={{ width:1, height:20, background:"#e5e7eb" }}/>
+          <button onClick={onScreenerBacktest} style={{
+            padding:"6px 16px", borderRadius:8, border:"1px solid #6366f1",
+            background:"transparent", color:"#6366f1", fontSize:12, fontWeight:700, cursor:"pointer",
+          }}>Backtest</button>
         </div>
       </div>
 
       {/* Table */}
+      <div style={{ margin:"16px 24px 24px", background:"#fff", borderRadius:14, border:"1px solid #e5e7eb", overflow:"hidden" }}>
       <div style={{ overflowX:"auto" }}>
         {error ? (
           <div style={{ padding:48, textAlign:"center", color:"#dc2626", fontSize:14 }}>
@@ -406,7 +478,7 @@ function ScannerPage({ market, setMarket, onDetails, onBacktest }) {
             </thead>
             <tbody>
               {filtered.length === 0 ? (
-                <tr><td colSpan={10} style={{ padding:48, textAlign:"center", color:"#9ca3af", fontSize:13 }}>No coins match your filters.</td></tr>
+                <tr><td colSpan={11} style={{ padding:48, textAlign:"center", color:"#9ca3af", fontSize:13 }}>No coins match your filters.</td></tr>
               ) : filtered.map((row, i) => {
                 const { base, quote } = fmtSym(row.symbol);
                 return (
@@ -421,11 +493,12 @@ function ScannerPage({ market, setMarket, onDetails, onBacktest }) {
                       <span style={{ color:"#9ca3af", fontSize:11 }}>{quote}</span>
                     </td>
                     <td style={{ padding:"11px 14px" }}><Trend t={row.ema_trend}/></td>
+                    <td style={{ padding:"11px 14px", textAlign:"right" }}><ScoreBadge v={row.score}/></td>
                     <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", fontWeight:500 }}>{fmtPrice(row.price)}</td>
+                    <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums" }}><ChgCell v={row.change_1h}/></td>
                     <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums" }}><ChgCell v={row.change_24h}/></td>
                     <td style={{ padding:"11px 14px", textAlign:"right", color:"#374151", fontVariantNumeric:"tabular-nums" }}>{fmtVol(row.volume_24h)}</td>
                     <td style={{ padding:"11px 14px" }}><SigBadge s={row.last_signal}/></td>
-                    <td style={{ padding:"11px 14px", textAlign:"right", color:"#6b7280", fontVariantNumeric:"tabular-nums" }}>{row.cross_price ? fmtPrice(row.cross_price) : "—"}</td>
                     <td style={{ padding:"11px 14px", color:"#6b7280", whiteSpace:"nowrap", fontSize:12 }}>{row.signal_time ? fmtTime(row.signal_time) : "—"}</td>
                     <td style={{ padding:"11px 14px" }}>
                       <button
@@ -448,6 +521,7 @@ function ScannerPage({ market, setMarket, onDetails, onBacktest }) {
           </table>
         )}
       </div>
+      </div>
 
       {/* Detail modal */}
       {modal && (
@@ -465,7 +539,9 @@ function ScannerPage({ market, setMarket, onDetails, onBacktest }) {
             </div>
             <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:16 }}>
               {[
+                {l:"Score", v:<ScoreBadge v={modal.score}/>},
                 {l:"Price", v:`$${fmtPrice(modal.price)}`},
+                {l:"1H Change", v:<ChgCell v={modal.change_1h}/>},
                 {l:"24H Change", v:<ChgCell v={modal.change_24h}/>},
                 {l:"Volume (24H)", v:fmtVol(modal.volume_24h)},
                 {l:"Last Signal", v:<SigBadge s={modal.last_signal}/>},
@@ -504,6 +580,340 @@ function ScannerPage({ market, setMarket, onDetails, onBacktest }) {
   );
 }
 
+// ─── Screener Backtest Page (aggregate Day/Week/Month WIN/LOSS/OPEN) ─────────
+const BT_PERIOD_LABELS = [["day","Day"],["week","Week"],["month","Month"]];
+
+function ScreenerBacktestPage({ market, onBack }) {
+  const [btPeriod, setBtPeriod] = useState("day");
+  const [btRrMode, setBtRrMode] = useState("1:2");
+  const [btStats, setBtStats] = useState(null);
+  const [btLoading, setBtLoading] = useState(true);
+  const [btError, setBtError] = useState(null);
+  const [trades, setTrades] = useState([]);
+  const [sort, setSort] = useState({ k:"_entryTimeMs", dir:"desc" });
+  const [exporting, setExporting] = useState(false);
+  const fetchIdRef = useRef(0);
+
+  // Aggregate Day/Week/Month backtest — how many of ALL 1H signals in this
+  // window resolved as WIN/LOSS, or are still OPEN. Reuses the same
+  // signal+candle-driven SL/TP simulation as the per-coin Backtest page
+  // (runBacktestFromSignals) — never recomputed on the backend, per this
+  // app's "signals from DB, SL/TP simulation on the frontend" convention.
+  const fetchBacktestStats = useCallback(async () => {
+    // Guards against out-of-order responses: if the period/RR mode changes
+    // again before this request lands (e.g. Day -> Month clicked quickly),
+    // a slower older request must not be allowed to clobber the newer one's
+    // state once it resolves.
+    const requestId = ++fetchIdRef.current;
+    setBtLoading(true);
+    setBtError(null);
+    try {
+      const days = BT_PERIOD_DAYS[btPeriod];
+      // Only fetch as many candles as this window actually needs (plus a
+      // buffer for the SL/TP walk-forward after entry) instead of always
+      // pulling the full 1500-candle history — cuts payload size a lot for
+      // Day/Week, and meaningfully for Month too.
+      const candleLimit = Math.min(1500, days * 24 + 200);
+      const sigRes = await fetch(`${API_BASE}/signals?market=${market}&interval=1h&days=${days}&limit=500`);
+      if (!sigRes.ok) throw new Error(`API ${sigRes.status}`);
+      const rawSignals = await sigRes.json();
+
+      const bySymbol = new Map();
+      for (const s of rawSignals) {
+        if (!bySymbol.has(s.symbol)) bySymbol.set(s.symbol, []);
+        bySymbol.get(s.symbol).push({
+          type: s.signal_type, crossPrice: s.cross_price,
+          crossTimeMs: new Date(s.cross_time).getTime(),
+        });
+      }
+
+      const perSymbol = await Promise.all([...bySymbol.entries()].map(async ([symbol, sigs]) => {
+        const res = await fetch(`${API_BASE}/candles/${symbol}?interval=1h&market=${market}&limit=${candleLimit}`);
+        if (!res.ok) return [];
+        const rawCandles = await res.json();
+        const candles = rawCandles.map(r => ({
+          symbol, openTimeMs: r[0],
+          open: parseFloat(r[1]), high: parseFloat(r[2]), low: parseFloat(r[3]), close: parseFloat(r[4]),
+        }));
+        return runBacktestFromSignals(candles, sigs, btRrMode, 3650, CANDLE_MS_MAP["1h"], "1h");
+      }));
+
+      if (fetchIdRef.current !== requestId) return; // a newer request has since superseded this one
+
+      const allTrades = perSymbol.flat();
+      const won    = allTrades.filter(t => t.result === "WIN").length;
+      const lost   = allTrades.filter(t => t.result === "LOSS").length;
+      const closed = allTrades.filter(t => t.result === "WIN" || t.result === "LOSS");
+      const pnl    = closed.reduce((sum, t) => sum + t.gainPct, 0);
+      setBtStats({ won, lost, pnl, total: allTrades.length });
+      setTrades(allTrades);
+    } catch (e) {
+      if (fetchIdRef.current === requestId) {
+        setBtStats(null);
+        setTrades([]);
+        setBtError(e.message);
+      }
+    } finally {
+      if (fetchIdRef.current === requestId) setBtLoading(false);
+    }
+  }, [btPeriod, btRrMode, market]);
+
+  useEffect(() => { fetchBacktestStats(); }, [fetchBacktestStats]);
+
+  const toggleSort = k => setSort(s => s.k===k ? {k, dir:s.dir==="asc"?"desc":"asc"} : {k, dir:"desc"});
+  const sortedTrades = [...trades].sort((a, b) => {
+    const dir = sort.dir === "asc" ? 1 : -1;
+    const av = a[sort.k], bv = b[sort.k];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1; if (bv == null) return -1;
+    return typeof av === "string" ? dir*av.localeCompare(bv) : dir*(av-bv);
+  });
+
+  // Export CSV — re-runs the same signal+candle simulation for Day, Week,
+  // AND Month (independent of whichever period is currently selected on
+  // screen) and downloads one combined file with a Period column, so you
+  // get all three windows in a single export rather than just what's shown.
+  const exportAllPeriods = useCallback(async () => {
+    setExporting(true);
+    try {
+      const allRows = [];
+      for (const period of ["day", "week", "month"]) {
+        const days = BT_PERIOD_DAYS[period];
+        const candleLimit = Math.min(1500, days * 24 + 200);
+        const sigRes = await fetch(`${API_BASE}/signals?market=${market}&interval=1h&days=${days}&limit=500`);
+        if (!sigRes.ok) continue;
+        const rawSignals = await sigRes.json();
+
+        const bySymbol = new Map();
+        for (const s of rawSignals) {
+          if (!bySymbol.has(s.symbol)) bySymbol.set(s.symbol, []);
+          bySymbol.get(s.symbol).push({
+            type: s.signal_type, crossPrice: s.cross_price,
+            crossTimeMs: new Date(s.cross_time).getTime(),
+          });
+        }
+
+        const perSymbol = await Promise.all([...bySymbol.entries()].map(async ([symbol, sigs]) => {
+          const res = await fetch(`${API_BASE}/candles/${symbol}?interval=1h&market=${market}&limit=${candleLimit}`);
+          if (!res.ok) return [];
+          const rawCandles = await res.json();
+          const candles = rawCandles.map(r => ({
+            symbol, openTimeMs: r[0],
+            open: parseFloat(r[1]), high: parseFloat(r[2]), low: parseFloat(r[3]), close: parseFloat(r[4]),
+          }));
+          return runBacktestFromSignals(candles, sigs, btRrMode, 3650, CANDLE_MS_MAP["1h"], "1h");
+        }));
+
+        for (const t of perSymbol.flat()) allRows.push({ period, ...t });
+      }
+
+      const header = [
+        "Period","Symbol","Signal Type","Signal Time","Entry Time","Entry Price",
+        "Stop Loss","Take Profit","Exit Time","Exit Price","Exit Reason",
+        "Duration","PnL %","PnL Amount","Result",
+      ];
+      const csvEscape = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+      const lines = [header.join(",")];
+      for (const t of allRows) {
+        const open = t.result === "OPEN";
+        lines.push([
+          t.period.toUpperCase(), t.symbol, t.tradeSignal, t.signalTime || "", t.entryTime,
+          t.entryPrice, t.stopLoss, t.targetPrice,
+          open ? "Still running" : t.entryCloseTime,
+          open ? "" : t.entryClose,
+          t.exitReason, t.duration,
+          open ? "" : t.gainPct.toFixed(2),
+          open ? "" : t.gainAmount,
+          t.result,
+        ].map(csvEscape).join(","));
+      }
+
+      const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `backtest_${market}_${btRrMode.replace(":","-")}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setBtError(`Export failed: ${e.message}`);
+    } finally {
+      setExporting(false);
+    }
+  }, [market, btRrMode]);
+
+  return (
+    <div style={{ fontFamily:"'Inter',system-ui,sans-serif", background:"#f5f6f8", minHeight:"100vh", width:"100%", color:"#111827" }}>
+      {/* Header */}
+      <div style={{ display:"flex", alignItems:"center", gap:10, padding:"13px 24px", borderBottom:"1px solid #e8eaed", flexWrap:"wrap" }}>
+        <button onClick={onBack} style={{
+          display:"flex", alignItems:"center", gap:5, padding:"5px 12px",
+          borderRadius:7, border:"1px solid #e5e7eb", background:"transparent",
+          fontSize:12, fontWeight:600, color:"#374151", cursor:"pointer",
+        }}>← Back</button>
+        <span style={{ color:"#d1d5db", fontSize:14 }}>›</span>
+        <span style={{ fontWeight:800, fontSize:17 }}>Backtest Summary</span>
+        <span style={{ color:"#9ca3af", fontSize:12 }}>All coins · {market === "spot" ? "Spot" : "USDT Futures"} · 1H signals</span>
+        <button onClick={exportAllPeriods} disabled={exporting} style={{
+          marginLeft:"auto", display:"flex", alignItems:"center", gap:6,
+          padding:"7px 16px", borderRadius:8, border:"none",
+          background:"#111827", color:"#fff", fontSize:12, fontWeight:700,
+          cursor: exporting ? "not-allowed" : "pointer", opacity: exporting ? 0.6 : 1,
+        }}>{exporting ? "Exporting…" : "⭳ Export"}</button>
+      </div>
+
+      {/* Controls + cards */}
+      <div style={{ padding:"20px 24px" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:16, flexWrap:"wrap" }}>
+          <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Period</span>
+          <div style={{ display:"flex", gap:4 }}>
+            {BT_PERIOD_LABELS.map(([k,l]) => (
+              <button key={k} disabled={btLoading} onClick={()=>setBtPeriod(k)} style={{
+                padding:"5px 14px", borderRadius:7, fontSize:12, fontWeight:700,
+                cursor: btLoading ? "not-allowed" : "pointer", opacity: btLoading && btPeriod!==k ? 0.5 : 1,
+                border: btPeriod===k ? "1px solid #111827" : "1px solid #e5e7eb",
+                background: btPeriod===k ? "#111827" : "#fff",
+                color: btPeriod===k ? "#fff" : "#6b7280",
+              }}>{l}</button>
+            ))}
+          </div>
+          <div style={{ width:1, height:20, background:"#e5e7eb" }}/>
+          <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>RR</span>
+          <div style={{ display:"flex", gap:4 }}>
+            {RR_MODES.map(m => (
+              <button key={m} disabled={btLoading} onClick={()=>setBtRrMode(m)} style={{
+                padding:"5px 14px", borderRadius:7, fontSize:12, fontWeight:700,
+                cursor: btLoading ? "not-allowed" : "pointer", opacity: btLoading && btRrMode!==m ? 0.5 : 1,
+                border: btRrMode===m ? "1.5px solid #f59e0b" : "1px solid #e5e7eb",
+                background: btRrMode===m ? "#fff7ed" : "#fff",
+                color: btRrMode===m ? "#f59e0b" : "#6b7280",
+              }}>{m}</button>
+            ))}
+          </div>
+          {btLoading && <span style={{ fontSize:11, color:"#9ca3af" }}>Loading…</span>}
+        </div>
+
+        {btError ? (
+          <div style={{ padding:48, textAlign:"center", color:"#dc2626", fontSize:14, background:"#fff", borderRadius:14, border:"1px solid #e5e7eb" }}>
+            <div style={{ fontSize:22, marginBottom:8 }}>⚠</div>
+            Could not load backtest stats: <code style={{ fontSize:12 }}>{btError}</code>
+          </div>
+        ) : (
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))", gap:16 }}>
+            <SummaryCard
+              label="Won" badge="WIN" badgeBg="#bbf1d3" badgeColor="#166534"
+              value={btStats?.won ?? "—"} valueColor="#16a34a" bg="#e7f8ef" Icon={CheckCircle2}
+            />
+            <SummaryCard
+              label="Loss" badge="LOSS" badgeBg="#fbcfd1" badgeColor="#991b1b"
+              value={btStats?.lost ?? "—"} valueColor="#dc2626" bg="#fdecec" Icon={XCircle}
+            />
+            <SummaryCard
+              label="PnL %" badge={btStats && btStats.pnl >= 0 ? "PROFIT" : "LOSS"}
+              badgeBg={btStats && btStats.pnl >= 0 ? "#bfe3fb" : "#fbcfd1"}
+              badgeColor={btStats && btStats.pnl >= 0 ? "#075985" : "#991b1b"}
+              value={btStats ? `${btStats.pnl >= 0 ? "+" : ""}${btStats.pnl.toFixed(2)}%` : "—"}
+              valueColor={btStats && btStats.pnl >= 0 ? "#0891b2" : "#dc2626"} bg="#e6f6fd" Icon={Percent}
+            />
+            <SummaryCard
+              label="Total" badge={btPeriod.toUpperCase()} badgeBg="#111827" badgeColor="#fff"
+              value={btStats?.total ?? "—"} valueColor="#111827" bg="#e7e7fb" Icon={ListChecks}
+            />
+          </div>
+        )}
+
+        {/* All trades in this window */}
+        {!btError && (
+          <div style={{ marginTop:20, background:"#fff", borderRadius:14, border:"1px solid #e5e7eb", overflow:"hidden" }}>
+            <div style={{ overflowX:"auto" }}>
+              {btLoading ? (
+                <div style={{ padding:60, textAlign:"center", color:"#9ca3af", fontSize:13 }}>Loading trades…</div>
+              ) : sortedTrades.length === 0 ? (
+                <div style={{ padding:60, textAlign:"center", color:"#9ca3af", fontSize:14 }}>
+                  No signals in this window.
+                </div>
+              ) : (
+                <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
+                  <thead>
+                    <tr>
+                      {BCOLS.map(col => (
+                        <TH key={col.k} right={col.r} onClick={()=>toggleSort(col.k)} sorted={sort.k===col.k} dir={sort.dir}>{col.l}</TH>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sortedTrades.map((t, i) => {
+                      const win    = t.result === "WIN";
+                      const open   = t.result === "OPEN";
+                      const forced = t.exitReason === "Closed by new signal";
+                      const buy    = t.tradeSignal === "BUY";
+                      return (
+                        <tr key={i}
+                          style={{ borderBottom:"1px solid #f3f4f6", background:i%2===0?"#fff":"#fafafa" }}
+                          onMouseEnter={e=>e.currentTarget.style.background="#f5f3ff"}
+                          onMouseLeave={e=>e.currentTarget.style.background=i%2===0?"#fff":"#fafafa"}
+                        >
+                          <td style={{ padding:"10px 14px", fontWeight:700 }}>
+                            <span style={{ color:"#f59e0b" }}>{t.symbol.replace("/USDT","")}</span>
+                            <span style={{ color:"#9ca3af", fontSize:10 }}>/USDT</span>
+                          </td>
+                          <td style={{ padding:"10px 14px" }}>
+                            <span style={{
+                              display:"inline-block", padding:"2px 8px", borderRadius:4, fontSize:11,
+                              fontWeight:700, background:buy?"#dcfce7":"#fee2e2", color:buy?"#15803d":"#b91c1c"
+                            }}>{t.tradeSignal}</span>
+                          </td>
+                          <td style={{ padding:"10px 14px", color:"#374151", whiteSpace:"nowrap", fontSize:11 }}>{t.signalTime || "—"}</td>
+                          <td style={{ padding:"10px 14px", color:"#374151", whiteSpace:"nowrap", fontSize:11 }}>{t.entryTime}</td>
+                          <td style={{ padding:"10px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", fontWeight:600, color:"#111827" }}>{fmtPrice(t.entryPrice)}</td>
+                          <td style={{ padding:"10px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#dc2626" }}>{fmtPrice(t.stopLoss)}</td>
+                          <td style={{ padding:"10px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#16a34a" }}>{fmtPrice(t.targetPrice)}</td>
+                          <td style={{ padding:"10px 14px", color:"#374151", whiteSpace:"nowrap", fontSize:11 }}>
+                            {open ? <span style={{ color:"#9ca3af" }}>Still running</span> : t.entryCloseTime}
+                          </td>
+                          <td style={{ padding:"10px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", fontWeight:500 }}>
+                            {open ? <span style={{ color:"#9ca3af" }}>—</span> : fmtPrice(t.entryClose)}
+                          </td>
+                          <td style={{ padding:"10px 14px" }}>
+                            <span style={{
+                              fontSize:11, fontWeight:500,
+                              color: open ? "#0891b2" : forced ? "#6366f1" : t.exitReason==="Target Hit" ? "#15803d" : "#b91c1c"
+                            }}>{t.exitReason}</span>
+                          </td>
+                          <td style={{ padding:"10px 14px", color:"#6b7280", whiteSpace:"nowrap" }}>{t.duration}</td>
+                          <td style={{ padding:"10px 14px", textAlign:"right", fontWeight:700, fontVariantNumeric:"tabular-nums",
+                            color: open ? "#9ca3af" : t.gainPct>=0?"#16a34a":"#dc2626"
+                          }}>
+                            {open ? "—" : `${t.gainPct>=0?"+":""}${t.gainPct.toFixed(2)}%`}
+                          </td>
+                          <td style={{ padding:"10px 14px", textAlign:"right", fontWeight:600, fontVariantNumeric:"tabular-nums",
+                            color: open ? "#9ca3af" : t.gainAmount>=0?"#16a34a":"#dc2626"
+                          }}>
+                            {open ? "—" : `${t.gainAmount>=0?"+":""}${fmtPrice(t.gainAmount)}`}
+                          </td>
+                          <td style={{ padding:"10px 14px" }}>
+                            <span style={{
+                              display:"inline-block", padding:"2px 8px", borderRadius:4, fontSize:11, fontWeight:700,
+                              background: open ? "#e0f2fe" : forced ? "#ede9fe" : win ? "#dcfce7" : "#fee2e2",
+                              color:      open ? "#0369a1" : forced ? "#6d28d9" : win ? "#15803d" : "#b91c1c"
+                            }}>{t.result}</span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── Details Page (coin details + full crossover history) ────────────────────
 const ALL_TIMEFRAMES = ["1h", "2h", "4h", "6h"];
 const CROSS_COLS = [
@@ -512,6 +922,23 @@ const CROSS_COLS = [
   {k:"cross_time",  l:"Signal Time"},
   {k:"cross_price", l:"Cross Price", r:true},
   {k:"result",      l:"Result"},
+];
+
+const BCOLS = [
+  {k:"symbol",        l:"Symbol"},
+  {k:"tradeSignal",   l:"Signal Type"},
+  {k:"signalTime",    l:"Signal Time"},
+  {k:"_entryTimeMs",  l:"Entry Time"},
+  {k:"entryPrice",    l:"Entry Price",    r:true},
+  {k:"stopLoss",      l:"Stop Loss",      r:true},
+  {k:"targetPrice",   l:"Take Profit",    r:true},
+  {k:"entryCloseTime",l:"Exit Time"},
+  {k:"entryClose",    l:"Exit Price",     r:true},
+  {k:"exitReason",    l:"Exit Reason"},
+  {k:"duration",      l:"Duration"},
+  {k:"gainPct",       l:"PnL %",          r:true},
+  {k:"gainAmount",    l:"PnL Amount",     r:true},
+  {k:"result",        l:"Result"},
 ];
 
 const ResultBadge = ({ result }) => {
@@ -587,6 +1014,13 @@ function DetailsPage({ row, market, onBack, onBacktest }) {
 
   useEffect(() => { fetchSignals(); }, [fetchSignals]);
 
+  // Auto-refresh every 20s so an OPEN crossover picks up a live SL/TP hit
+  // (fresh candle data) without needing to leave and re-open this page.
+  useEffect(() => {
+    const id = setInterval(fetchSignals, 20000);
+    return () => clearInterval(id);
+  }, [fetchSignals]);
+
   return (
     <div style={{ fontFamily:"'Inter',system-ui,sans-serif", background:"#fff", minHeight:"100vh", width:"100%", color:"#111827" }}>
       {/* Header */}
@@ -605,7 +1039,9 @@ function DetailsPage({ row, market, onBack, onBacktest }) {
       {/* Detail cards */}
       <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))", gap:12, padding:"16px 24px", borderBottom:"1px solid #e8eaed" }}>
         {[
+          {l:"Score",        v:<ScoreBadge v={row?.score}/>},
           {l:"Price",        v:`$${fmtPrice(row?.price)}`},
+          {l:"1H Change",    v:<ChgCell v={row?.change_1h ?? 0}/>},
           {l:"24H Change",   v:<ChgCell v={row?.change_24h ?? 0}/>},
           {l:"Volume (24H)", v:fmtVol(row?.volume_24h)},
           {l:"Last Signal",  v:<SigBadge s={row?.last_signal}/>},
@@ -814,23 +1250,6 @@ function BacktestPage({ scanRow, initialMarket, onBack }) {
 
   const toggleSort = k => setSort(s => s.k===k?{k,dir:s.dir==="asc"?"desc":"asc"}:{k,dir:"desc"});
 
-  const BCOLS = [
-    {k:"symbol",        l:"Symbol"},
-    {k:"tradeSignal",   l:"Signal Type"},
-    {k:"signalTime",    l:"Signal Time"},
-    {k:"_entryTimeMs",  l:"Entry Time"},
-    {k:"entryPrice",    l:"Entry Price",    r:true},
-    {k:"stopLoss",      l:"Stop Loss",      r:true},
-    {k:"targetPrice",   l:"Take Profit",    r:true},
-    {k:"entryCloseTime",l:"Exit Time"},
-    {k:"entryClose",    l:"Exit Price",     r:true},
-    {k:"exitReason",    l:"Exit Reason"},
-    {k:"duration",      l:"Duration"},
-    {k:"gainPct",       l:"PnL %",          r:true},
-    {k:"gainAmount",    l:"PnL Amount",     r:true},
-    {k:"result",        l:"Result"},
-  ];
-
   return (
     <div style={{ fontFamily:"'Inter',system-ui,sans-serif", background:"#fff", minHeight:"100vh", width:"100%", color:"#111827" }}>
 
@@ -1031,6 +1450,10 @@ export default function App() {
     setPage("backtest");
   }, [page]);
 
+  const goScreenerBacktest = useCallback(() => {
+    setPage("screener-backtest");
+  }, []);
+
   // Returning from Details always lands back on the scanner, which remounts
   // ScannerPage and restarts its auto-refresh polling.
   const goBackFromDetails = useCallback(() => {
@@ -1042,7 +1465,8 @@ export default function App() {
     setPage(backtestFrom);
   }, [backtestFrom]);
 
-  if (page === "backtest") return <BacktestPage scanRow={scanRow} initialMarket={market} onBack={goBackFromBacktest}/>;
-  if (page === "details")  return <DetailsPage row={detailsRow} market={market} onBack={goBackFromDetails} onBacktest={goBacktest}/>;
-  return <ScannerPage market={market} setMarket={setMarket} onDetails={goDetails} onBacktest={goBacktest}/>;
+  if (page === "backtest")           return <BacktestPage scanRow={scanRow} initialMarket={market} onBack={goBackFromBacktest}/>;
+  if (page === "details")            return <DetailsPage row={detailsRow} market={market} onBack={goBackFromDetails} onBacktest={goBacktest}/>;
+  if (page === "screener-backtest")  return <ScreenerBacktestPage market={market} onBack={goBackFromDetails}/>;
+  return <ScannerPage market={market} setMarket={setMarket} onDetails={goDetails} onBacktest={goBacktest} onScreenerBacktest={goScreenerBacktest}/>;
 }

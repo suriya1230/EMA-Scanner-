@@ -42,6 +42,7 @@ class SymbolState:
     """In-memory EMA/trend snapshot per symbol — rebuilt from Postgres candles."""
     symbol: str
     price: float      = 0.0
+    change_1h: float  = 0.0
     change_24h: float = 0.0
     volume_24h: float = 0.0
     ema_7: float  = 0.0
@@ -50,6 +51,7 @@ class SymbolState:
     last_signal_type:  str | None    = None
     last_cross_price:  float | None  = None
     last_signal_time:  object | None = None   # datetime | None
+    score: float = 0.0   # 0-100 — see ScannerService._compute_score
 
 
 class ScannerService:
@@ -191,13 +193,25 @@ class ScannerService:
                 continue
 
             closes = np.array([c.close for c in candles], dtype=float)
+            highs  = np.array([c.high  for c in candles], dtype=float)
+            lows   = np.array([c.low   for c in candles], dtype=float)
             ema7, ema25, ema99 = self._engine.calculate_emas(closes)
             info = tickers.get(symbol, {})
             sig = sig_map.get(symbol)
+            change_1h = ((closes[-1] - closes[-2]) / closes[-2] * 100) if len(closes) >= 2 and closes[-2] != 0 else 0.0
+            score = await self._compute_score(
+                symbol=symbol, price=float(closes[-1]),
+                ema7=float(ema7[-1]), ema25=float(ema25[-1]), ema99=float(ema99[-1]),
+                highs=highs, lows=lows, closes=closes,
+                last_signal_type=sig.signal_type if sig else None,
+                change_1h=float(change_1h), change_24h=info.get("change_24h", 0.0),
+                volume_24h=info.get("volume_24h", 0.0),
+            )
 
             self._states[symbol] = SymbolState(
                 symbol=symbol,
                 price=info.get("price", 0.0),
+                change_1h=float(change_1h),
                 change_24h=info.get("change_24h", 0.0),
                 volume_24h=info.get("volume_24h", 0.0),
                 ema_7=float(ema7[-1]),
@@ -206,7 +220,92 @@ class ScannerService:
                 last_signal_type=sig.signal_type if sig else None,
                 last_cross_price=sig.cross_price if sig else None,
                 last_signal_time=sig.cross_time if sig else None,
+                score=score,
             )
+
+    # ── Signal Score (0-100) ─────────────────────────────────────────────────
+    #
+    # Grades the coin's LAST SIGNAL (not the current live trend) — "how
+    # strong/still-valid does that BUY or SELL signal look right now, given
+    # what price has done since." No last signal at all -> nothing to grade -> 0.
+    # Weighted blend of six factors, each already backed by real stored data
+    # (no fabricated inputs):
+    #   20% EMA separation   — |EMA7-EMA99| as % of price; wider = more decisive trend
+    #   20% Higher-TF agree  — does the 4H/6H trend agree with the signal's direction
+    #   15% Momentum         — does 1H/24H price change agree with the signal's direction
+    #   15% Volatility (ATR) — EMA separation relative to normal 1H noise (ATR14)
+    #   15% Volume           — 24H volume as a liquidity proxy
+    #   15% Distance/EMA99   — how extended price is from EMA99 (fresh vs exhausted)
+    # If price has since reversed against the signal, momentum/higher-TF
+    # agreement naturally score low — this is what lets Score fall over time
+    # even without a new opposite signal firing.
+
+    HIGHER_TF_INTERVALS = ("4h", "6h")
+
+    async def _compute_score(
+        self, symbol: str, price: float, ema7: float, ema25: float, ema99: float,
+        highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, last_signal_type: str | None,
+        change_1h: float, change_24h: float, volume_24h: float,
+    ) -> float:
+        if not last_signal_type or price <= 0:
+            return 0.0
+        direction = 1 if last_signal_type == "BUY" else -1
+
+        ema_sep_pct = abs(ema7 - ema99) / price * 100
+        ema_sep_score = min(100.0, (ema_sep_pct / 3.0) * 100)
+
+        atr = self._engine.compute_atr(highs, lows, closes)
+        atr_pct = (atr / price * 100) if price > 0 else 0.0
+        volatility_score = 50.0 if atr_pct <= 0 else min(100.0, (ema_sep_pct / atr_pct) * 50)
+
+        avg_change = (change_1h + change_24h) / 2
+        momentum_score = max(0.0, min(100.0, 50 + (avg_change * direction) * 10))
+
+        agree_count = await self._higher_tf_agreement(symbol, direction)
+        higher_tf_score = agree_count * 50.0
+
+        if volume_24h <= settings.MIN_VOLUME_USDT_SIGNAL:
+            volume_score = 0.0
+        else:
+            volume_score = min(100.0, (volume_24h - settings.MIN_VOLUME_USDT_SIGNAL)
+                                / (200_000_000 - settings.MIN_VOLUME_USDT_SIGNAL) * 100)
+
+        dist_pct = abs(price - ema99) / ema99 * 100 if ema99 > 0 else 0.0
+        if dist_pct < 0.2:
+            distance_score = (dist_pct / 0.2) * 60
+        elif dist_pct <= 2.0:
+            distance_score = 100.0
+        elif dist_pct >= 6.0:
+            distance_score = 0.0
+        else:
+            distance_score = 100 - (dist_pct - 2.0) / (6.0 - 2.0) * 100
+
+        score = (
+            0.20 * ema_sep_score +
+            0.20 * higher_tf_score +
+            0.15 * momentum_score +
+            0.15 * volatility_score +
+            0.15 * volume_score +
+            0.15 * distance_score
+        )
+        return round(max(0.0, min(100.0, score)), 1)
+
+    async def _higher_tf_agreement(self, symbol: str, direction: int) -> int:
+        """How many of the 4H/6H trends agree with the last signal's direction (0-2)."""
+        agree = 0
+        for interval in self.HIGHER_TF_INTERVALS:
+            async with AsyncSessionLocal() as session:
+                candles = await CandleRepository.get_candles(
+                    session, symbol, interval=interval, market=self._market, limit=settings.CANDLES_LIMIT
+                )
+            if len(candles) < 2:
+                continue
+            closes = np.array([c.close for c in candles], dtype=float)
+            ema7, ema25, ema99 = self._engine.calculate_emas(closes)
+            tf_trend = self._engine.classify_trend(float(ema7[-1]), float(ema25[-1]), float(ema99[-1]))
+            if (direction == 1 and tf_trend == "Bullish") or (direction == -1 and tf_trend == "Bearish"):
+                agree += 1
+        return agree
 
     # ── Live WebSocket Candle Processing (1H only — scanner table) ──────────
     #
@@ -265,6 +364,8 @@ class ScannerService:
         state.ema_7  = float(ema7[-1])
         state.ema_25 = float(ema25[-1])
         state.ema_99 = float(ema99[-1])
+        if len(closes) >= 2 and closes[-2] != 0:
+            state.change_1h = float((closes[-1] - closes[-2]) / closes[-2] * 100)
 
         signal = self._engine.detect_signal(ema7, ema25, ema99, open_times)
         if signal is None:
@@ -347,6 +448,8 @@ class ScannerService:
                 "ema_trend":   self._engine.classify_trend(
                                    state.ema_7, state.ema_25, state.ema_99),
                 "price":       state.price,
+                "score":       state.score,
+                "change_1h":   state.change_1h,
                 "change_24h":  state.change_24h,
                 "volume_24h":  state.volume_24h,
                 "ema_7":       state.ema_7,

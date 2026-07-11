@@ -60,6 +60,8 @@ class ScannerRow(BaseModel):
     symbol: str
     ema_trend: str                      # "Bullish" | "Bearish" | "Neutral"
     price: float
+    score: float = 0.0                   # 0-100 signal-quality score
+    change_1h: float = 0.0               # % change over the last 1H candle
     change_24h: float                   # % change
     volume_24h: float                   # USDT
     last_signal: Optional[str]          # "BUY" | "SELL" | None
@@ -97,6 +99,4 @@ class StatusResponse(BaseModel):
 class ExchangeBreakdown(BaseModel):
     binance_spot: int
     binance_futures: int
-    bybit_futures: int
-    okx_futures: int
     total_futures: int

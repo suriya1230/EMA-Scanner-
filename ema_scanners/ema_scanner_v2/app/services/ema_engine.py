@@ -201,9 +201,19 @@ class EMAEngine:
           Entry = exact interpolated EMA7/EMA99 crossover price+time.
 
         Strict BUY→SELL→BUY alternation — no consecutive duplicates.
+
+        Requires at least `self.long` (EMA_LONG, e.g. 99) candles of history
+        before producing any signal. With fewer candles than that — e.g. a
+        symbol that was only listed a day or two ago — EMA99 hasn't actually
+        converged yet; pandas' ewm() still returns *a* number from the very
+        first candle onward, but it's an artifact of the too-short warmup,
+        not a real 99-period average. TradingView and most other platforms
+        withhold EMA99 entirely until enough candles exist for exactly this
+        reason — this guard matches that behavior instead of firing "crossovers"
+        on EMA lines that are still stabilizing.
         """
         n = len(ema7)
-        if n < 2:
+        if n < max(2, self.long):
             return []
 
         signals: list[SignalEvent] = []
@@ -396,3 +406,21 @@ class EMAEngine:
         if ema7 < ema25 < ema99:
             return "Bearish"
         return "Neutral"
+
+    # ── Volatility (ATR) ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def compute_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> float:
+        """Average True Range over the last `period` candles — used as the
+        "normal noise" baseline a trend move is judged against for scoring.
+        Returns 0.0 if there isn't enough history yet."""
+        n = len(closes)
+        if n < period + 1:
+            return 0.0
+        prev_closes = closes[:-1]
+        highs_s, lows_s = highs[1:], lows[1:]
+        true_range = np.maximum(
+            highs_s - lows_s,
+            np.maximum(np.abs(highs_s - prev_closes), np.abs(lows_s - prev_closes)),
+        )
+        return float(np.mean(true_range[-period:]))

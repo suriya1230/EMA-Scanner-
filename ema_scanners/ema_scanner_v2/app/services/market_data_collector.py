@@ -26,8 +26,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import Counter
-from urllib.parse import urlparse
 
 import aiohttp
 import ccxt.async_support as ccxt
@@ -37,7 +35,6 @@ from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_
 from app.core.config import settings
 from app.db.database import AsyncSessionLocal
 from app.services.ema_engine import INTERVAL_MS
-from app.services.exchange_universe import build_extended_futures_universe
 from app.services.repository import CandleRepository
 
 logger = logging.getLogger(__name__)
@@ -69,11 +66,7 @@ BATCH_SIZE = 70              # STEP 3 — symbols per batch
 BATCH_WINDOW_SECONDS = 60    # never start more than BATCH_SIZE symbols per this window
 HOST_COOLDOWN_SECONDS = 300  # STEP 1 failover — skip an erroring spot host for 5 min
 
-# Per-request candle page size — Binance/Bybit both honor up to 1000, but OKX
-# silently caps every response at 300 regardless of what's requested. Using
-# the wrong (too-high) limit as the "did we get a full page" check would make
-# OKX's pagination stop after just one page, so this must be exchange-aware.
-EXCHANGE_PAGE_LIMIT = {"binance": 1000, "bybit": 1000, "okx": 300}
+PAGE_LIMIT = 1000  # Binance honors up to 1000 candles per request
 
 RETRYABLE = (ccxt.NetworkError,)  # covers ExchangeNotAvailable/DDoSProtection/RateLimitExceeded/RequestTimeout
 
@@ -181,13 +174,10 @@ class MarketDataCollector:
         self._session: aiohttp.ClientSession | None = None
         self._spot: _RotatingSpotClient | None = None
         self._futures: ccxt.binanceusdm | None = None
-        self._bybit: ccxt.bybit | None = None     # futures-universe expansion only (see exchange_universe.py)
-        self._okx: ccxt.okx | None = None         # same
         self._spot_symbols: list[str] = []       # sorted by 24h volume desc — scanner "rank" order
         self._futures_symbols: list[str] = []
         self._spot_tickers: dict[str, dict] = {}     # raw symbol -> {price, volume_24h, change_24h}
         self._futures_tickers: dict[str, dict] = {}
-        self._futures_exchange: dict[str, str] = {}  # futures symbol -> "binance"|"bybit"|"okx"
 
     @property
     def spot_symbols(self) -> list[str]:
@@ -207,13 +197,10 @@ class MarketDataCollector:
 
     @property
     def exchange_breakdown(self) -> dict[str, int]:
-        """Per-exchange symbol counts from the most recent filter refresh."""
-        counts = Counter(self._futures_exchange.values())
+        """Binance-only symbol counts from the most recent filter refresh."""
         return {
             "binance_spot": len(self._spot_symbols),
-            "binance_futures": counts.get("binance", 0),
-            "bybit_futures": counts.get("bybit", 0),
-            "okx_futures": counts.get("okx", 0),
+            "binance_futures": len(self._futures_symbols),
             "total_futures": len(self._futures_symbols),
         }
 
@@ -227,45 +214,18 @@ class MarketDataCollector:
         self._session = aiohttp.ClientSession(connector=connector)
         self._spot = _RotatingSpotClient(self._session)
         self._futures = ccxt.binanceusdm({"enableRateLimit": True, "session": self._session})
-        self._bybit = ccxt.bybit({"enableRateLimit": True, "session": self._session})
-        self._okx = ccxt.okx({
-            "enableRateLimit": True,
-            "session": self._session,
-            "hostname": urlparse(settings.OKX_REST).netloc,
-            "options": {"fetchMarkets": ["swap"]},  # perpetual futures only, per exchange_universe.py
-        })
 
         await self._spot.load_markets()
         await _retry(self._futures.load_markets)
 
-        # Bybit/OKX are additive (futures-universe expansion only) — if either
-        # fails to load here, disable just that one and keep going; Binance
-        # spot+futures must never be blocked by them.
-        try:
-            await _retry(self._bybit.load_markets)
-        except Exception as exc:
-            logger.warning("Bybit load_markets failed — Bybit universe additions disabled this run: %s", exc)
-            self._bybit = None
-        try:
-            await _retry(self._okx.load_markets)
-        except Exception as exc:
-            logger.warning("OKX load_markets failed — OKX universe additions disabled this run: %s", exc)
-            self._okx = None
-
         logger.info(
-            "MarketDataCollector started — %d spot markets, %d futures markets loaded (bybit=%s, okx=%s)",
+            "MarketDataCollector started — %d spot markets, %d futures markets loaded",
             len(self._spot.markets), len(self._futures.markets),
-            len(self._bybit.markets) if self._bybit else "disabled",
-            len(self._okx.markets) if self._okx else "disabled",
         )
 
     async def stop(self):
         if self._spot:
             await self._spot.close()
-        if self._bybit:
-            await self._bybit.close()
-        if self._okx:
-            await self._okx.close()
         if self._futures:
             await self._futures.close()
         if self._session:
@@ -310,79 +270,12 @@ class MarketDataCollector:
             self._futures_symbols, self._futures_tickers = self._filter_symbols(
                 tickers, self._futures.markets, market="futures"
             )
-            self._futures_exchange = {sym: "binance" for sym in self._futures_symbols}
             logger.info(
-                "Futures scan queue refreshed: %d Binance symbols (volume > %.0f USDT)",
+                "Futures scan queue refreshed: %d symbols (volume > %.0f USDT)",
                 len(self._futures_symbols), settings.MIN_VOLUME_USDT_COLLECT,
             )
         except Exception as exc:
             logger.error("Futures symbol filter refresh failed: %s", exc)
-            return  # nothing to extend below if even the Binance universe failed
-
-        # Bybit/OKX universe expansion is fully isolated from the Binance
-        # refresh above — any failure here must never touch the Binance
-        # symbols/tickers already committed to self._futures_* above.
-        try:
-            binance_bases = self._all_binance_futures_bases()
-            extra_symbols, extra_tickers, extra_exchange = await self._fetch_extended_futures_universe(binance_bases)
-            self._futures_symbols = self._futures_symbols + extra_symbols
-            self._futures_tickers = {**self._futures_tickers, **extra_tickers}
-            self._futures_exchange = {**self._futures_exchange, **extra_exchange}
-        except Exception as exc:
-            logger.error("Bybit/OKX universe extension failed (Binance universe unaffected): %s", exc)
-
-        by_exchange = Counter(self._futures_exchange.values())
-        logger.info(
-            "Coin universe — Binance: %d spot, %d futures | Bybit: %d futures | OKX: %d futures | total futures: %d",
-            len(self._spot_symbols), by_exchange.get("binance", 0),
-            by_exchange.get("bybit", 0), by_exchange.get("okx", 0),
-            len(self._futures_symbols),
-        )
-
-    def _all_binance_futures_bases(self) -> set[str]:
-        """Every base asset Binance lists as a USDT-M perpetual, regardless of
-        current 24h volume or active/delisted status.
-
-        This must NOT be `self._futures_symbols` (the volume-filtered scan
-        list) — a base can drop below the $10M threshold on Binance while
-        still being a live Binance market, and Bybit/OKX often use the exact
-        same raw symbol string for the same base (e.g. "SOXLUSDT" on both
-        Binance and Bybit). Excluding only the filtered subset would let
-        Bybit/OKX candles get written under a symbol Binance still owns,
-        silently splicing two exchanges' price history into one row identity.
-        """
-        return {
-            m["base"] for m in self._futures.markets.values()
-            if m.get("quote") == "USDT" and m.get("swap") and m.get("linear")
-        }
-
-    async def _fetch_extended_futures_universe(
-        self, binance_bases: set[str]
-    ) -> tuple[list[str], dict[str, dict], dict[str, str]]:
-        """Bybit/OKX perpetuals for bases Binance doesn't list (see
-        exchange_universe.py). Skips any addition whose exchange client
-        failed to load markets in start()."""
-        additions = await build_extended_futures_universe(self._session, binance_bases)
-
-        symbols: list[str] = []
-        tickers: dict[str, dict] = {}
-        exchange_of: dict[str, str] = {}
-        for item in additions:
-            client = self._bybit if item["exchange"] == "bybit" else self._okx
-            if client is None:
-                continue
-            m = _market_by_id(client.markets_by_id, item["symbol"])
-            if not m:
-                logger.warning("%s market metadata missing for %s — skipping", item["exchange"], item["symbol"])
-                continue
-            symbols.append(item["symbol"])
-            tickers[item["symbol"]] = {
-                "price": item.get("price", 0.0),
-                "volume_24h": item["volume"],
-                "change_24h": item.get("change_24h", 0.0),
-            }
-            exchange_of[item["symbol"]] = item["exchange"]
-        return symbols, tickers, exchange_of
 
     @staticmethod
     def _filter_symbols(tickers: dict, markets: dict, market: str) -> tuple[list[str], dict[str, dict]]:
@@ -437,15 +330,13 @@ class MarketDataCollector:
                 await asyncio.sleep(remaining)
 
     async def _fetch_and_store(self, market: str, symbol: str, interval: str):
-        exchange = self._futures_exchange.get(symbol, "binance") if market == "futures" else "binance"
         candle_ms = INTERVAL_MS[interval]
-        markets_by_id = self._markets_by_id_for(market, exchange)
+        markets_by_id = self._spot.markets_by_id if market == "spot" else self._futures.markets_by_id
         m = _market_by_id(markets_by_id, symbol)
         if not m:
-            logger.warning("No %s market metadata for %s (%s) — skipping", market, symbol, exchange)
+            logger.warning("No %s market metadata for %s — skipping", market, symbol)
             return
         unified = m["symbol"]
-        page_limit = EXCHANGE_PAGE_LIMIT[exchange]
 
         async with AsyncSessionLocal() as session:
             latest_open = await CandleRepository.get_latest_open_time(
@@ -458,21 +349,19 @@ class MarketDataCollector:
             target = CANDLE_RETENTION[interval]
             since = None
             fetched = 0
-            # ceil(target / page_limit) + 1 safety round — scales with each
-            # exchange's own page size instead of assuming Binance's 1000.
-            max_rounds = -(-target // page_limit) + 1
+            max_rounds = -(-target // PAGE_LIMIT) + 1  # ceil(target/PAGE_LIMIT) + 1 safety round
             for _ in range(max_rounds):
-                page = await self._fetch_ohlcv(market, exchange, unified, interval, since=since, limit=page_limit)
+                page = await self._fetch_ohlcv(market, unified, interval, since=since, limit=PAGE_LIMIT)
                 if not page:
                     break
                 rows.extend(page)
                 fetched += len(page)
                 since = int(page[-1][0]) + 1
-                if fetched >= target or len(page) < page_limit:
+                if fetched >= target or len(page) < PAGE_LIMIT:
                     break
         else:
             # Incremental catch-up — only what's closed since the last stored candle.
-            page = await self._fetch_ohlcv(market, exchange, unified, interval, since=latest_open + 1, limit=page_limit)
+            page = await self._fetch_ohlcv(market, unified, interval, since=latest_open + 1, limit=PAGE_LIMIT)
             rows.extend(page or [])
 
         if not rows:
@@ -501,20 +390,7 @@ class MarketDataCollector:
             )
             await session.commit()
 
-    def _markets_by_id_for(self, market: str, exchange: str) -> dict:
-        if market == "spot":
-            return self._spot.markets_by_id
-        if exchange == "bybit":
-            return self._bybit.markets_by_id if self._bybit else {}
-        if exchange == "okx":
-            return self._okx.markets_by_id if self._okx else {}
-        return self._futures.markets_by_id
-
-    async def _fetch_ohlcv(self, market: str, exchange: str, unified_symbol: str, interval: str, since, limit: int):
+    async def _fetch_ohlcv(self, market: str, unified_symbol: str, interval: str, since, limit: int):
         if market == "spot":
             return await self._spot.call("fetch_ohlcv", unified_symbol, timeframe=interval, since=since, limit=limit)
-        if exchange == "bybit":
-            return await _retry(self._bybit.fetch_ohlcv, unified_symbol, timeframe=interval, since=since, limit=limit)
-        if exchange == "okx":
-            return await _retry(self._okx.fetch_ohlcv, unified_symbol, timeframe=interval, since=since, limit=limit)
         return await _retry(self._futures.fetch_ohlcv, unified_symbol, timeframe=interval, since=since, limit=limit)

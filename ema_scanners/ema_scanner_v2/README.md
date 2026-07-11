@@ -135,7 +135,7 @@ pytest tests/ -v
 |----------|---------|-------------|
 | `DATABASE_URL` | postgresql+asyncpg://postgres:postgres@localhost:5432/ema_scanner | PostgreSQL connection |
 | `MIN_VOLUME_USDT_COLLECT` | 0 | Min 24H volume to fetch/store candles for (0 = no filter, all coins) |
-| `MIN_VOLUME_USDT_SIGNAL` | 10000000 | Min 24H volume to run EMA/signal generation on |
+| `MIN_VOLUME_USDT_SIGNAL` | 1000000 | Min 24H volume to run EMA/signal generation on |
 | `CANDLES_LIMIT` | 3000 | Candles kept per symbol |
 | `EMA_SHORT` | 7 | EMA 7 period |
 | `EMA_MID` | 25 | EMA 25 period |

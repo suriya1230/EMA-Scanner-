@@ -13,21 +13,14 @@ class Settings(BaseSettings):
     BINANCE_FUTURES_WS: str  = "wss://fstream.binance.com"
     BINANCE_SPOT_WS: str     = "wss://stream.binance.com:9443"
 
-    # Bybit / OKX — perpetual-futures universe expansion (fills in coins
-    # Binance doesn't list; see app/services/exchange_universe.py)
-    BYBIT_REST: str = "https://api.bybit.com"
-    # www.okx.com is unreachable from some networks/regions; app.okx.com
-    # serves the identical public REST API and is used as the default here.
-    OKX_REST: str   = "https://app.okx.com"
-
     # Scanner
-    # COLLECT is set to 0 — no volume filter, every USDT symbol on every
-    # exchange gets candles fetched and stored, no matter how illiquid.
+    # COLLECT is set to 0 — no volume filter, every Binance USDT symbol gets
+    # candles fetched and stored, no matter how illiquid.
     # SIGNAL is the only real cutoff, applied later when building EMA state /
     # generating signals, so raising/lowering it needs no re-backfill — the
     # candle history for every coin is already there.
     MIN_VOLUME_USDT_COLLECT: float = 0.0
-    MIN_VOLUME_USDT_SIGNAL: float  = 10_000_000.0
+    MIN_VOLUME_USDT_SIGNAL: float  = 1_000_000.0
     CANDLES_LIMIT: int     = 3000
     CANDLE_INTERVAL: str   = "1h"
 
