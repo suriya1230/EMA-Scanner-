@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { TrendingUp, TrendingDown, Target, Database, CheckCircle2, XCircle, ListChecks, Percent } from "lucide-react";
+import { TrendingUp, TrendingDown, Target, Database, CheckCircle2, XCircle, DollarSign, Award } from "lucide-react";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000/api";
@@ -99,6 +99,59 @@ const SummaryCard = ({ label, badge, badgeBg, badgeColor, value, valueColor, bg,
   </div>
 );
 
+// Free-form Risk:Reward entry — sits alongside the 1:2 / 2:4 presets so any
+// ratio can be backtested, not just the two built-in ones. Uncontrolled
+// inputs keyed on `value` so clicking a preset button resets them to match,
+// without fighting the parent's controlled rrMode state on every keystroke.
+const RRCustomInput = ({ value, onChange, disabled }) => {
+  const [riskDefault, rewardDefault] = value.split(":");
+  const [risk, setRisk] = useState(riskDefault);
+  const [reward, setReward] = useState(rewardDefault);
+
+  // Reset the fields to match whenever a preset button changes `value`
+  // externally — otherwise a stale typed value would linger after a preset click.
+  useEffect(() => { setRisk(riskDefault); setReward(rewardDefault); }, [riskDefault, rewardDefault]);
+
+  const apply = () => {
+    const r = parseFloat(risk), w = parseFloat(reward);
+    if (r > 0 && w > 0) onChange(`${r}:${w}`);
+  };
+
+  // Same look as the 1:2 / 2:4 preset buttons — plain bordered box, not a
+  // standout colored pill, so the custom entry reads as part of the same set.
+  const inputStyle = {
+    width:44, padding:"5px 6px", borderRadius:7, border:"1px solid #e5e7eb",
+    fontSize:12, fontWeight:600, textAlign:"center", color:"#6b7280",
+    outline:"none", background:"#fff",
+  };
+
+  return (
+    <div style={{ marginLeft:"auto", display:"flex", alignItems:"center", gap:6 }}>
+      <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase", whiteSpace:"nowrap" }}>
+        Customize Risk &amp; Reward
+      </span>
+      <input
+        type="number" step="0.5" min="0.1" disabled={disabled} value={risk} title="Risk %"
+        onChange={e => setRisk(e.target.value)}
+        onKeyDown={e => { if (e.key === "Enter") apply(); }}
+        style={inputStyle}
+      />
+      <span style={{ color:"#9ca3af", fontSize:12 }}>:</span>
+      <input
+        type="number" step="0.5" min="0.1" disabled={disabled} value={reward} title="Reward %"
+        onChange={e => setReward(e.target.value)}
+        onKeyDown={e => { if (e.key === "Enter") apply(); }}
+        style={inputStyle}
+      />
+      <button onClick={apply} disabled={disabled} style={{
+        padding:"5px 12px", borderRadius:7, fontSize:12, fontWeight:700,
+        cursor: disabled ? "not-allowed" : "pointer",
+        border:"1px solid #e5e7eb", background:"#fff", color:"#6b7280",
+      }}>Apply</button>
+    </div>
+  );
+};
+
 const ChgCell = ({ v }) => (
   <span style={{ color: v>=0?"#16a34a":"#dc2626", fontWeight:500 }}>
     {v>=0?"+":""}{v.toFixed(2)}%
@@ -122,10 +175,13 @@ const MarketToggle = ({ market, setMarket }) => (
 // from the backend due to logic version mismatches), we fetch the signals
 // directly from the DB and use them as-is. Only the SL/TP simulation runs
 // on the frontend using the candle OHLC data.
-function runBacktestFromSignals(candles, dbSignals, rrMode, windowDays, candleMs = 3_600_000, timeframe = '1h') {
+function runBacktestFromSignals(candles, dbSignals, rrMode, windowDays, candleMs = 3_600_000, timeframe = '1h', capital = 1000) {
   if (!candles || candles.length === 0 || !dbSignals) return [];
 
-  const [riskPct, rewardPct] = rrMode === "1:2" ? [1, 2] : [2, 4];
+  // rrMode is any "risk:reward" string, e.g. "1:2", "2:4", or a custom
+  // user-entered ratio like "1.5:3" — parsed generically instead of only
+  // recognizing the two original presets.
+  const [riskPct, rewardPct] = rrMode.split(":").map(Number);
 
   // Window cutoff — relative to last candle
   const windowMs     = windowDays * 24 * 3_600_000;
@@ -194,14 +250,20 @@ function runBacktestFromSignals(candles, dbSignals, rrMode, windowDays, candleMs
     }
     if (sigCandleIdx === -1) continue;  // signal candle not in fetched data
 
-    // Entry = signal candle close price, entry time = candle close time.
-    // If that candle hasn't actually closed yet, its "close" is just a live,
-    // still-changing price snapshot — not a real entry — so skip this signal
-    // entirely until the candle finishes (it'll be picked up on a later refresh).
-    const entryTimeMs = candles[sigCandleIdx].openTimeMs + candleMs;
+    // Entry = the NEXT candle's open price/time — the signal candle has
+    // already closed by the time you could realistically act on it, so the
+    // earliest honest fill is the following candle's open, not a price
+    // inside (or the close of) the candle that already happened.
+    // If that next candle doesn't exist yet (signal fired on the most
+    // recent candle available), skip this signal entirely until it's
+    // picked up on a later refresh once that candle exists.
+    const entryCandleIdx = sigCandleIdx + 1;
+    if (entryCandleIdx >= candles.length) continue;
+
+    const entryTimeMs = candles[entryCandleIdx].openTimeMs;
     if (entryTimeMs > Date.now()) continue;
 
-    const entryPrice  = candles[sigCandleIdx].close;
+    const entryPrice  = candles[entryCandleIdx].open;
     const signalTime  = fmtDateTime(crossTimeMs);
     const entryTime   = fmtDateTime(entryTimeMs);
 
@@ -225,12 +287,13 @@ function runBacktestFromSignals(candles, dbSignals, rrMode, windowDays, candleMs
       prev.result         = gainPct >= 0 ? "WIN" : "LOSS";
       prev.gainPct        = gainPct;
       prev.gainAmount     = gainAmount;
+      prev.gainDollar     = (capital * gainPct) / 100;
       prev._exitTimeMs    = forceTime;
       openTradeRef        = null;
     }
 
-    // Simulate this trade — walk from candle AFTER signal candle
-    const sim = simulateTradeFromIdx(type, entryPrice, sigCandleIdx + 1, riskPct, rewardPct);
+    // Simulate this trade — walk forward starting at the entry candle itself
+    const sim = simulateTradeFromIdx(type, entryPrice, entryCandleIdx, riskPct, rewardPct);
     const { stopLoss, targetPrice, exitPrice, exitTimeMs, exitReason } = sim;
 
     if (!exitPrice) {
@@ -238,7 +301,7 @@ function runBacktestFromSignals(candles, dbSignals, rrMode, windowDays, candleMs
         date: fmtDate(entryTimeMs), timeFrame: timeframe.toUpperCase(), symbol: symLabel,
         tradeSignal: type, signalTime, entryTime, entryPrice, stopLoss, targetPrice,
         entryClose: null, entryCloseTime: null, exitReason: "Open", duration: "—",
-        result: "OPEN", gainPct: null, gainAmount: null,
+        result: "OPEN", gainPct: null, gainAmount: null, gainDollar: null,
         _entryTimeMs: entryTimeMs, _exitTimeMs: null,
       };
       trades.push(row);
@@ -248,6 +311,7 @@ function runBacktestFromSignals(candles, dbSignals, rrMode, windowDays, candleMs
 
     const gainPct    = type === "BUY" ? ((exitPrice - entryPrice) / entryPrice) * 100 : ((entryPrice - exitPrice) / entryPrice) * 100;
     const gainAmount = type === "BUY" ? exitPrice - entryPrice : entryPrice - exitPrice;
+    const gainDollar = (capital * gainPct) / 100;
     const result     = exitReason === "Target Hit" ? "WIN" : "LOSS";
     const durationMs = exitTimeMs - entryTimeMs;
     const dh         = Math.floor(durationMs / 3_600_000);
@@ -258,7 +322,7 @@ function runBacktestFromSignals(candles, dbSignals, rrMode, windowDays, candleMs
       date: fmtDate(entryTimeMs), timeFrame: timeframe.toUpperCase(), symbol: symLabel,
       tradeSignal: type, signalTime, entryTime, entryPrice, stopLoss, targetPrice,
       entryClose: exitPrice, entryCloseTime: fmtDateTime(exitTimeMs), exitReason,
-      duration, result, gainPct, gainAmount,
+      duration, result, gainPct, gainAmount, gainDollar,
       _entryTimeMs: entryTimeMs, _exitTimeMs: exitTimeMs,
     });
     openTradeRef = null;
@@ -586,6 +650,7 @@ const BT_PERIOD_LABELS = [["day","Day"],["week","Week"],["month","Month"]];
 function ScreenerBacktestPage({ market, onBack }) {
   const [btPeriod, setBtPeriod] = useState("day");
   const [btRrMode, setBtRrMode] = useState("1:2");
+  const [btCapital, setBtCapital] = useState(1000);
   const [btStats, setBtStats] = useState(null);
   const [btLoading, setBtLoading] = useState(true);
   const [btError, setBtError] = useState(null);
@@ -614,16 +679,24 @@ function ScreenerBacktestPage({ market, onBack }) {
       // pulling the full 1500-candle history — cuts payload size a lot for
       // Day/Week, and meaningfully for Month too.
       const candleLimit = Math.min(1500, days * 24 + 200);
-      const sigRes = await fetch(`${API_BASE}/signals?market=${market}&interval=1h&days=${days}&limit=500`);
+      const sigRes = await fetch(`${API_BASE}/signals?market=${market}&interval=1h&days=${days}&limit=10000`);
       if (!sigRes.ok) throw new Error(`API ${sigRes.status}`);
       const rawSignals = await sigRes.json();
 
+      // The backend occasionally stores the same crossover twice (near-identical
+      // cross_time a few hundred ms apart, from separate scan runs) — collapse
+      // those down to one signal per symbol/type/minute before simulating, same
+      // as the Details/Backtest pages already do.
       const bySymbol = new Map();
+      const seenKeys = new Set();
       for (const s of rawSignals) {
+        const crossTimeMs = new Date(s.cross_time).getTime();
+        const dedupeKey = `${s.symbol}|${s.signal_type}|${Math.round(crossTimeMs / 60000)}`;
+        if (seenKeys.has(dedupeKey)) continue;
+        seenKeys.add(dedupeKey);
         if (!bySymbol.has(s.symbol)) bySymbol.set(s.symbol, []);
         bySymbol.get(s.symbol).push({
-          type: s.signal_type, crossPrice: s.cross_price,
-          crossTimeMs: new Date(s.cross_time).getTime(),
+          type: s.signal_type, crossPrice: s.cross_price, crossTimeMs,
         });
       }
 
@@ -635,7 +708,11 @@ function ScreenerBacktestPage({ market, onBack }) {
           symbol, openTimeMs: r[0],
           open: parseFloat(r[1]), high: parseFloat(r[2]), low: parseFloat(r[3]), close: parseFloat(r[4]),
         }));
-        return runBacktestFromSignals(candles, sigs, btRrMode, 3650, CANDLE_MS_MAP["1h"], "1h");
+        // runBacktestFromSignals requires oldest->newest — the API returns
+        // signals newest-first, so this must be sorted before simulating
+        // (every other caller of this function already does this).
+        const sortedSigs = [...sigs].sort((a, b) => a.crossTimeMs - b.crossTimeMs);
+        return runBacktestFromSignals(candles, sortedSigs, btRrMode, 3650, CANDLE_MS_MAP["1h"], "1h", btCapital);
       }));
 
       if (fetchIdRef.current !== requestId) return; // a newer request has since superseded this one
@@ -645,7 +722,9 @@ function ScreenerBacktestPage({ market, onBack }) {
       const lost   = allTrades.filter(t => t.result === "LOSS").length;
       const closed = allTrades.filter(t => t.result === "WIN" || t.result === "LOSS");
       const pnl    = closed.reduce((sum, t) => sum + t.gainPct, 0);
-      setBtStats({ won, lost, pnl, total: allTrades.length });
+      const pnlDollar = closed.reduce((sum, t) => sum + t.gainDollar, 0);
+      const winRate = closed.length > 0 ? (won / closed.length) * 100 : null;
+      setBtStats({ won, lost, pnl, pnlDollar, winRate, total: allTrades.length });
       setTrades(allTrades);
     } catch (e) {
       if (fetchIdRef.current === requestId) {
@@ -656,7 +735,7 @@ function ScreenerBacktestPage({ market, onBack }) {
     } finally {
       if (fetchIdRef.current === requestId) setBtLoading(false);
     }
-  }, [btPeriod, btRrMode, market]);
+  }, [btPeriod, btRrMode, btCapital, market]);
 
   useEffect(() => { fetchBacktestStats(); }, [fetchBacktestStats]);
 
@@ -680,16 +759,22 @@ function ScreenerBacktestPage({ market, onBack }) {
       for (const period of ["day", "week", "month"]) {
         const days = BT_PERIOD_DAYS[period];
         const candleLimit = Math.min(1500, days * 24 + 200);
-        const sigRes = await fetch(`${API_BASE}/signals?market=${market}&interval=1h&days=${days}&limit=500`);
+        const sigRes = await fetch(`${API_BASE}/signals?market=${market}&interval=1h&days=${days}&limit=10000`);
         if (!sigRes.ok) continue;
         const rawSignals = await sigRes.json();
 
+        // Same near-duplicate collapse as the on-screen stats — otherwise a
+        // signal the backend stored twice would double-count in the export.
         const bySymbol = new Map();
+        const seenKeys = new Set();
         for (const s of rawSignals) {
+          const crossTimeMs = new Date(s.cross_time).getTime();
+          const dedupeKey = `${s.symbol}|${s.signal_type}|${Math.round(crossTimeMs / 60000)}`;
+          if (seenKeys.has(dedupeKey)) continue;
+          seenKeys.add(dedupeKey);
           if (!bySymbol.has(s.symbol)) bySymbol.set(s.symbol, []);
           bySymbol.get(s.symbol).push({
-            type: s.signal_type, crossPrice: s.cross_price,
-            crossTimeMs: new Date(s.cross_time).getTime(),
+            type: s.signal_type, crossPrice: s.cross_price, crossTimeMs,
           });
         }
 
@@ -701,7 +786,8 @@ function ScreenerBacktestPage({ market, onBack }) {
             symbol, openTimeMs: r[0],
             open: parseFloat(r[1]), high: parseFloat(r[2]), low: parseFloat(r[3]), close: parseFloat(r[4]),
           }));
-          return runBacktestFromSignals(candles, sigs, btRrMode, 3650, CANDLE_MS_MAP["1h"], "1h");
+          const sortedSigs = [...sigs].sort((a, b) => a.crossTimeMs - b.crossTimeMs);
+          return runBacktestFromSignals(candles, sortedSigs, btRrMode, 3650, CANDLE_MS_MAP["1h"], "1h", btCapital);
         }));
 
         for (const t of perSymbol.flat()) allRows.push({ period, ...t });
@@ -710,7 +796,7 @@ function ScreenerBacktestPage({ market, onBack }) {
       const header = [
         "Period","Symbol","Signal Type","Signal Time","Entry Time","Entry Price",
         "Stop Loss","Take Profit","Exit Time","Exit Price","Exit Reason",
-        "Duration","PnL %","PnL Amount","Result",
+        "Duration","PnL %","PnL Amount","PnL ($)","Result",
       ];
       const csvEscape = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
       const lines = [header.join(",")];
@@ -724,6 +810,7 @@ function ScreenerBacktestPage({ market, onBack }) {
           t.exitReason, t.duration,
           open ? "" : t.gainPct.toFixed(2),
           open ? "" : t.gainAmount,
+          open ? "" : t.gainDollar.toFixed(2),
           t.result,
         ].map(csvEscape).join(","));
       }
@@ -742,7 +829,7 @@ function ScreenerBacktestPage({ market, onBack }) {
     } finally {
       setExporting(false);
     }
-  }, [market, btRrMode]);
+  }, [market, btRrMode, btCapital]);
 
   return (
     <div style={{ fontFamily:"'Inter',system-ui,sans-serif", background:"#f5f6f8", minHeight:"100vh", width:"100%", color:"#111827" }}>
@@ -792,7 +879,19 @@ function ScreenerBacktestPage({ market, onBack }) {
               }}>{m}</button>
             ))}
           </div>
+          <div style={{ width:1, height:20, background:"#e5e7eb" }}/>
+          <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Capital</span>
+          <div style={{ display:"flex", alignItems:"center", gap:4 }}>
+            <span style={{ color:"#9ca3af", fontSize:12 }}>$</span>
+            <input
+              type="number" min="1" step="100" disabled={btLoading} defaultValue={btCapital}
+              onBlur={e => { const v = parseFloat(e.target.value); if (v > 0) setBtCapital(v); }}
+              onKeyDown={e => { if (e.key === "Enter") e.target.blur(); }}
+              style={{ width:80, padding:"4px 6px", borderRadius:6, border:"1px solid #e5e7eb", fontSize:12 }}
+            />
+          </div>
           {btLoading && <span style={{ fontSize:11, color:"#9ca3af" }}>Loading…</span>}
+          <RRCustomInput value={btRrMode} onChange={setBtRrMode} disabled={btLoading}/>
         </div>
 
         {btError ? (
@@ -811,15 +910,18 @@ function ScreenerBacktestPage({ market, onBack }) {
               value={btStats?.lost ?? "—"} valueColor="#dc2626" bg="#fdecec" Icon={XCircle}
             />
             <SummaryCard
-              label="PnL %" badge={btStats && btStats.pnl >= 0 ? "PROFIT" : "LOSS"}
-              badgeBg={btStats && btStats.pnl >= 0 ? "#bfe3fb" : "#fbcfd1"}
-              badgeColor={btStats && btStats.pnl >= 0 ? "#075985" : "#991b1b"}
-              value={btStats ? `${btStats.pnl >= 0 ? "+" : ""}${btStats.pnl.toFixed(2)}%` : "—"}
-              valueColor={btStats && btStats.pnl >= 0 ? "#0891b2" : "#dc2626"} bg="#e6f6fd" Icon={Percent}
+              label="PnL ($)" badge={btStats && btStats.pnlDollar >= 0 ? "PROFIT" : "LOSS"}
+              badgeBg={btStats && btStats.pnlDollar >= 0 ? "#bfe3fb" : "#fbcfd1"}
+              badgeColor={btStats && btStats.pnlDollar >= 0 ? "#075985" : "#991b1b"}
+              value={btStats ? `${btStats.pnlDollar >= 0 ? "+" : ""}$${btStats.pnlDollar.toFixed(2)}` : "—"}
+              valueColor={btStats && btStats.pnlDollar >= 0 ? "#0891b2" : "#dc2626"} bg="#e6f6fd" Icon={DollarSign}
             />
             <SummaryCard
-              label="Total" badge={btPeriod.toUpperCase()} badgeBg="#111827" badgeColor="#fff"
-              value={btStats?.total ?? "—"} valueColor="#111827" bg="#e7e7fb" Icon={ListChecks}
+              label="Win Rate" badge={btStats && btStats.winRate >= 50 ? "GOOD" : "LOW"}
+              badgeBg={btStats && btStats.winRate >= 50 ? "#bbf1d3" : "#fbcfd1"}
+              badgeColor={btStats && btStats.winRate >= 50 ? "#166534" : "#991b1b"}
+              value={btStats && btStats.winRate != null ? `${btStats.winRate.toFixed(1)}%` : "—"}
+              valueColor={btStats && btStats.winRate >= 50 ? "#16a34a" : "#dc2626"} bg="#fdf1e2" Icon={Award}
             />
           </div>
         )}
@@ -893,6 +995,11 @@ function ScreenerBacktestPage({ market, onBack }) {
                           }}>
                             {open ? "—" : `${t.gainAmount>=0?"+":""}${fmtPrice(t.gainAmount)}`}
                           </td>
+                          <td style={{ padding:"10px 14px", textAlign:"right", fontWeight:700, fontVariantNumeric:"tabular-nums",
+                            color: open ? "#9ca3af" : t.gainDollar>=0?"#16a34a":"#dc2626"
+                          }}>
+                            {open ? "—" : `${t.gainDollar>=0?"+":""}$${t.gainDollar.toFixed(2)}`}
+                          </td>
                           <td style={{ padding:"10px 14px" }}>
                             <span style={{
                               display:"inline-block", padding:"2px 8px", borderRadius:4, fontSize:11, fontWeight:700,
@@ -938,6 +1045,7 @@ const BCOLS = [
   {k:"duration",      l:"Duration"},
   {k:"gainPct",       l:"PnL %",          r:true},
   {k:"gainAmount",    l:"PnL Amount",     r:true},
+  {k:"gainDollar",    l:"PnL ($)",        r:true},
   {k:"result",        l:"Result"},
 ];
 
@@ -1123,6 +1231,7 @@ function StatCard({ label, value, color }) {
 function BacktestPage({ scanRow, initialMarket, onBack }) {
   const market = initialMarket || "futures";
   const [rrMode, setRrMode]       = useState("1:2");
+  const [capital, setCapital]     = useState(1000);
   const [window, setWindow]       = useState(7);
   const [timeframe, setTimeframe] = useState("1h");
   const [candles, setCandles]     = useState(null);
@@ -1225,9 +1334,9 @@ function BacktestPage({ scanRow, initialMarket, onBack }) {
   // path, no client-side EMA recomputation.
   useEffect(() => {
     if (candles && dbSignals) {
-      setTrades(runBacktestFromSignals(candles, dbSignals, rrMode, window, CANDLE_MS_MAP[timeframe], timeframe));
+      setTrades(runBacktestFromSignals(candles, dbSignals, rrMode, window, CANDLE_MS_MAP[timeframe], timeframe, capital));
     }
-  }, [candles, dbSignals, rrMode, window, timeframe]);
+  }, [candles, dbSignals, rrMode, window, timeframe, capital]);
 
   const sortedTrades = trades ? [...trades].sort((a,b)=>{
     const dir = sort.dir==="asc"?1:-1;
@@ -1263,7 +1372,7 @@ function BacktestPage({ scanRow, initialMarket, onBack }) {
         <span style={{ color:"#d1d5db", fontSize:14 }}>›</span>
         <span style={{ fontWeight:700, color:"#f59e0b", fontSize:15 }}>{base}</span>
         <span style={{ color:"#9ca3af", fontSize:14, fontWeight:400 }}>/USDT</span>
-        <span style={{ color:"#9ca3af", fontSize:13 }}>Backtest · Last {window} days · IST · EMA 7/25/99 · {timeframe.toUpperCase()} · Signal candle close entry</span>
+        <span style={{ color:"#9ca3af", fontSize:13 }}>Backtest · Last {window} days · IST · EMA 7/25/99 · {timeframe.toUpperCase()} · Next candle open entry</span>
         <div style={{ marginLeft:"auto", display:"flex", alignItems:"center", gap:12 }}>
           <button onClick={fetchData} disabled={reloading} style={{
             display:"flex", alignItems:"center", gap:5,
@@ -1284,6 +1393,16 @@ function BacktestPage({ scanRow, initialMarket, onBack }) {
             background:"transparent", color:rrMode===m?"#f59e0b":"#6b7280",
           }}>RR {m}</button>
         ))}
+        <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase", marginLeft:8 }}>Capital</span>
+        <div style={{ display:"flex", alignItems:"center", gap:4 }}>
+          <span style={{ color:"#9ca3af", fontSize:12 }}>$</span>
+          <input
+            type="number" min="1" step="100" defaultValue={capital}
+            onBlur={e => { const v = parseFloat(e.target.value); if (v > 0) setCapital(v); }}
+            onKeyDown={e => { if (e.key === "Enter") e.target.blur(); }}
+            style={{ width:80, padding:"4px 6px", borderRadius:6, border:"1px solid #e5e7eb", fontSize:12 }}
+          />
+        </div>
         <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase", marginLeft:8 }}>Window</span>
         {WIN_DAYS.map(d => (
           <button key={d} onClick={()=>setWindow(d)} style={{
@@ -1302,6 +1421,7 @@ function BacktestPage({ scanRow, initialMarket, onBack }) {
             transition:"all 0.15s",
           }}>{tf.toUpperCase()}</button>
         ))}
+        <RRCustomInput value={rrMode} onChange={setRrMode}/>
       </div>
 
       {/* Stat cards */}
@@ -1405,6 +1525,12 @@ function BacktestPage({ scanRow, initialMarket, onBack }) {
                       color: open ? "#9ca3af" : t.gainAmount>=0?"#16a34a":"#dc2626"
                     }}>
                       {open ? "—" : `${t.gainAmount>=0?"+":""}${fmtPrice(t.gainAmount)}`}
+                    </td>
+                    {/* PnL ($) */}
+                    <td style={{ padding:"10px 14px", textAlign:"right", fontWeight:700, fontVariantNumeric:"tabular-nums",
+                      color: open ? "#9ca3af" : t.gainDollar>=0?"#16a34a":"#dc2626"
+                    }}>
+                      {open ? "—" : `${t.gainDollar>=0?"+":""}$${t.gainDollar.toFixed(2)}`}
                     </td>
                     {/* Result */}
                     <td style={{ padding:"10px 14px" }}>

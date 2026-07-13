@@ -96,7 +96,7 @@ async def get_signals(
     signal_type: Optional[str] = Query(None, description="BUY or SELL"),
     interval: str = Query("1h", description="1m | 15m | 1h | 2h | 4h | 6h"),
     market: str = Query("futures", description="futures | spot"),
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(50, ge=1, le=10000),
     days: Optional[int] = Query(None, description="Filter signals from last N days (e.g. 7)"),
     db: AsyncSession = Depends(get_db),
 ):
