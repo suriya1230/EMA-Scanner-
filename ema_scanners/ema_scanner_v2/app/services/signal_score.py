@@ -12,14 +12,19 @@ WebSocket path) or reconstructed afterward from historical candles
 time" actually meaningful.
 
 Grades the signal's direction (BUY/SELL), not the coin's current live
-trend — weighted blend of six factors:
-  20% EMA separation   — |EMA7-EMA99| as % of price, at the signal candle
-  20% Higher-TF agree  — did the 4H/6H trend (as of the signal's own time,
+trend — weighted blend of six factors. Weights below were re-derived from a
+60-day/227-trade backtest correlating each factor against real WIN/LOSS
+outcomes (see score_analysis in project chat history) — ema_sep and momentum
+came back weakly correlated with LOSING, so their weight was cut; distance,
+higher-TF agreement, and volume leaned (weakly) toward winning, so theirs
+was raised:
+  10% EMA separation   — |EMA7-EMA99| as % of price, at the signal candle
+  25% Higher-TF agree  — did the 4H/6H trend (as of the signal's own time,
                           never using candles from after it) agree
-  15% Momentum         — 1H/24H price change (from candles) agreeing with direction
-  15% Volatility (ATR) — EMA separation relative to ATR14, at the signal candle
-  15% Volume           — rolling 24-candle volume sum as a liquidity proxy
-  15% Distance/EMA99   — how extended price is from EMA99, at the signal candle
+  10% Momentum         — 1H/24H price change (from candles) agreeing with direction
+  10% Volatility (ATR) — EMA separation relative to ATR14, at the signal candle
+  20% Volume           — rolling 24-candle volume sum as a liquidity proxy
+  25% Distance/EMA99   — how extended price is from EMA99, at the signal candle
 """
 from __future__ import annotations
 
@@ -61,11 +66,12 @@ def compute_score(
 
     window = volumes[max(0, idx - 23):idx + 1]
     vol_24h = float(window.sum())
+    VOLUME_SCORE_CAP = 30_000_000.0  # rolling 24-candle volume that earns full marks
     if vol_24h <= settings.MIN_VOLUME_USDT_SIGNAL:
         volume_score = 0.0
     else:
         volume_score = min(100.0, (vol_24h - settings.MIN_VOLUME_USDT_SIGNAL)
-                            / (200_000_000 - settings.MIN_VOLUME_USDT_SIGNAL) * 100)
+                            / (VOLUME_SCORE_CAP - settings.MIN_VOLUME_USDT_SIGNAL) * 100)
 
     ema99v = float(ema99[idx])
     dist_pct = abs(price - ema99v) / ema99v * 100 if ema99v > 0 else 0.0
@@ -78,13 +84,18 @@ def compute_score(
     else:
         distance_score = 100 - (dist_pct - 2.0) / (6.0 - 2.0) * 100
 
+    # Weights re-derived from a 60-day / 227-trade backtest correlating each
+    # factor against real WIN/LOSS outcomes: ema_sep and momentum came back
+    # weakly NEGATIVELY correlated with winning (were 20%/15%), while
+    # distance-from-EMA99, higher-TF agreement, and volume leaned (weakly)
+    # positive — so weight shifted away from the former, toward the latter.
     score = (
-        0.20 * ema_sep_score +
-        0.20 * higher_tf_score +
-        0.15 * momentum_score +
-        0.15 * volatility_score +
-        0.15 * volume_score +
-        0.15 * distance_score
+        0.10 * ema_sep_score +
+        0.25 * higher_tf_score +
+        0.10 * momentum_score +
+        0.10 * volatility_score +
+        0.20 * volume_score +
+        0.25 * distance_score
     )
     return round(max(0.0, min(100.0, score)), 1)
 

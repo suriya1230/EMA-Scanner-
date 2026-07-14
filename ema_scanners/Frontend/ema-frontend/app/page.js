@@ -104,7 +104,10 @@ const SummaryCard = ({ label, badge, badgeBg, badgeColor, value, valueColor, bg,
 // inputs keyed on `value` so clicking a preset button resets them to match,
 // without fighting the parent's controlled rrMode state on every keystroke.
 const RRCustomInput = ({ value, onChange, disabled }) => {
-  const [riskDefault, rewardDefault] = value.split(":");
+  // value can also be the "swing" sentinel (no colon) when Swing SL/TP mode
+  // is active — fall back to a default pair so these inputs stay controlled
+  // (defined) instead of flipping to undefined and tripping React's warning.
+  const [riskDefault, rewardDefault] = value === "swing" ? ["1", "2"] : value.split(":");
   const [risk, setRisk] = useState(riskDefault);
   const [reward, setReward] = useState(rewardDefault);
 
@@ -170,6 +173,34 @@ const MarketToggle = ({ market, setMarket }) => (
   </div>
 );
 
+// Most recent confirmed swing low/high strictly before `uptoIdx` (the last
+// fully-closed candle at entry time) — a pivot at index i only counts once
+// `strength` candles exist on BOTH sides with a higher low (or lower high),
+// and all of those confirming candles must also be <= uptoIdx so this never
+// looks at data that wouldn't exist yet at the moment of entry.
+function findRecentSwingLow(candles, uptoIdx, strength = 2, maxLookback = 100) {
+  const minIdx = Math.max(strength, uptoIdx - maxLookback);
+  for (let i = uptoIdx - strength; i >= minIdx; i--) {
+    let isPivot = true;
+    for (let k = 1; k <= strength; k++) {
+      if (candles[i].low >= candles[i - k].low || candles[i].low >= candles[i + k].low) { isPivot = false; break; }
+    }
+    if (isPivot) return candles[i].low;
+  }
+  return null;
+}
+function findRecentSwingHigh(candles, uptoIdx, strength = 2, maxLookback = 100) {
+  const minIdx = Math.max(strength, uptoIdx - maxLookback);
+  for (let i = uptoIdx - strength; i >= minIdx; i--) {
+    let isPivot = true;
+    for (let k = 1; k <= strength; k++) {
+      if (candles[i].high <= candles[i - k].high || candles[i].high <= candles[i + k].high) { isPivot = false; break; }
+    }
+    if (isPivot) return candles[i].high;
+  }
+  return null;
+}
+
 // ─── Backtest using DB signals (exact same signals as scanner page) ───────────
 // Instead of recalculating EMA crossovers on the frontend (which can differ
 // from the backend due to logic version mismatches), we fetch the signals
@@ -178,10 +209,14 @@ const MarketToggle = ({ market, setMarket }) => (
 function runBacktestFromSignals(candles, dbSignals, rrMode, windowDays, candleMs = 3_600_000, timeframe = '1h', capital = 1000) {
   if (!candles || candles.length === 0 || !dbSignals) return [];
 
-  // rrMode is any "risk:reward" string, e.g. "1:2", "2:4", or a custom
-  // user-entered ratio like "1.5:3" — parsed generically instead of only
-  // recognizing the two original presets.
-  const [riskPct, rewardPct] = rrMode.split(":").map(Number);
+  // rrMode is any "risk:reward" string, e.g. "1:2", "2:4", a custom
+  // user-entered ratio like "1.5:3", or the sentinel "swing" — meaning SL is
+  // derived from market structure (nearest swing low/high) instead of a
+  // fixed percentage, with TP always set to double that risk distance.
+  const isSwing = rrMode === "swing";
+  const [riskPct, rewardPct] = isSwing ? [null, null] : rrMode.split(":").map(Number);
+  const SWING_BUFFER = 0.001; // 0.1% beyond the swing point, so SL sits "just" past it rather than exactly on it
+  const SWING_FALLBACK_PCT = 1; // used only if no swing point is found in the lookback window
 
   // Window cutoff — relative to last candle
   const windowMs     = windowDays * 24 * 3_600_000;
@@ -204,14 +239,26 @@ function runBacktestFromSignals(candles, dbSignals, rrMode, windowDays, candleMs
     return candleOpenMs + t * candleMs;
   }
 
-  function simulateTradeFromIdx(type, entryPrice, startCandleIdx, rPct, rwPct) {
+  function simulateTradeFromIdx(type, entryPrice, startCandleIdx, sigCandleIdx) {
     let stopLoss, targetPrice;
-    if (type === "BUY") {
-      stopLoss    = entryPrice * (1 - rPct  / 100);
-      targetPrice = entryPrice * (1 + rwPct / 100);
+    if (isSwing) {
+      if (type === "BUY") {
+        const swingLow = findRecentSwingLow(candles, sigCandleIdx);
+        stopLoss = swingLow != null ? swingLow * (1 - SWING_BUFFER) : entryPrice * (1 - SWING_FALLBACK_PCT / 100);
+        const risk = entryPrice - stopLoss;
+        targetPrice = entryPrice + risk; // TP = same distance as SL (1:1)
+      } else {
+        const swingHigh = findRecentSwingHigh(candles, sigCandleIdx);
+        stopLoss = swingHigh != null ? swingHigh * (1 + SWING_BUFFER) : entryPrice * (1 + SWING_FALLBACK_PCT / 100);
+        const risk = stopLoss - entryPrice;
+        targetPrice = entryPrice - risk; // TP = same distance as SL (1:1)
+      }
+    } else if (type === "BUY") {
+      stopLoss    = entryPrice * (1 - riskPct  / 100);
+      targetPrice = entryPrice * (1 + rewardPct / 100);
     } else {
-      stopLoss    = entryPrice * (1 + rPct  / 100);
-      targetPrice = entryPrice * (1 - rwPct / 100);
+      stopLoss    = entryPrice * (1 + riskPct  / 100);
+      targetPrice = entryPrice * (1 - rewardPct / 100);
     }
     let exitPrice = null, exitTimeMs = null, exitReason = null;
     for (let j = startCandleIdx; j < candles.length; j++) {
@@ -293,7 +340,7 @@ function runBacktestFromSignals(candles, dbSignals, rrMode, windowDays, candleMs
     }
 
     // Simulate this trade — walk forward starting at the entry candle itself
-    const sim = simulateTradeFromIdx(type, entryPrice, entryCandleIdx, riskPct, rewardPct);
+    const sim = simulateTradeFromIdx(type, entryPrice, entryCandleIdx, sigCandleIdx);
     const { stopLoss, targetPrice, exitPrice, exitTimeMs, exitReason } = sim;
 
     if (!exitPrice) {
@@ -331,6 +378,10 @@ function runBacktestFromSignals(candles, dbSignals, rrMode, windowDays, candleMs
   return trades;
 }
 
+
+// Toggle to false to hide the "Swing SL/TP" button from both backtest pages
+// without removing the feature — flip back to true to bring it back.
+const SHOW_SWING_BUTTON = false;
 
 const SIGS  = ["All","BUY","SELL"];
 const BT_PERIOD_DAYS = { day: 1, week: 7, month: 30 };
@@ -424,7 +475,7 @@ function ScannerPage({ market, setMarket, onDetails, onBacktest, onScreenerBackt
         <div>
           <div style={{ fontSize:26, fontWeight:800, letterSpacing:"-0.02em" }}>EMA SCANNER</div>
           <div style={{ fontSize:12, color:"#9ca3af", fontWeight:600, marginTop:2, letterSpacing:"0.02em" }}>
-            TRIPLE EMA STRATEGY 7 › 25 › 99 · Binance {market === "spot" ? "Spot" : "USDT Futures"}
+            TRIPLE EMA STRATEGY 7 › 25 › 99 · {market === "spot" ? "Spot" : "USDT Futures"}
           </div>
         </div>
         <div style={{ display:"flex", alignItems:"center", gap:14, flexWrap:"wrap" }}>
@@ -878,6 +929,15 @@ function ScreenerBacktestPage({ market, onBack }) {
                 color: btRrMode===m ? "#f59e0b" : "#6b7280",
               }}>{m}</button>
             ))}
+            {SHOW_SWING_BUTTON && (
+              <button disabled={btLoading} onClick={()=>setBtRrMode("swing")} title="SL = just past the nearest swing low/high before entry, TP = same distance" style={{
+                padding:"5px 14px", borderRadius:7, fontSize:12, fontWeight:700,
+                cursor: btLoading ? "not-allowed" : "pointer", opacity: btLoading && btRrMode!=="swing" ? 0.5 : 1,
+                border: btRrMode==="swing" ? "1.5px solid #f59e0b" : "1px solid #e5e7eb",
+                background: btRrMode==="swing" ? "#fff7ed" : "#fff",
+                color: btRrMode==="swing" ? "#f59e0b" : "#6b7280",
+              }}>Swing SL/TP</button>
+            )}
           </div>
           <div style={{ width:1, height:20, background:"#e5e7eb" }}/>
           <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Capital</span>
@@ -1393,6 +1453,13 @@ function BacktestPage({ scanRow, initialMarket, onBack }) {
             background:"transparent", color:rrMode===m?"#f59e0b":"#6b7280",
           }}>RR {m}</button>
         ))}
+        {SHOW_SWING_BUTTON && (
+          <button onClick={()=>setRrMode("swing")} title="SL = just past the nearest swing low/high before entry, TP = same distance" style={{
+            padding:"4px 14px", borderRadius:6, fontSize:12, fontWeight:600, cursor:"pointer",
+            border:rrMode==="swing"?"1.5px solid #f59e0b":"1px solid #e5e7eb",
+            background:"transparent", color:rrMode==="swing"?"#f59e0b":"#6b7280",
+          }}>Swing SL/TP</button>
+        )}
         <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase", marginLeft:8 }}>Capital</span>
         <div style={{ display:"flex", alignItems:"center", gap:4 }}>
           <span style={{ color:"#9ca3af", fontSize:12 }}>$</span>
@@ -1433,7 +1500,7 @@ function BacktestPage({ scanRow, initialMarket, onBack }) {
           <StatCard label="Losses"       value={losses} color="#dc2626"/>
           <StatCard label="Win Rate"     value={winRate ? `${winRate}%` : "—"} color="#f59e0b"/>
           <StatCard label="Total P&L"    value={closedCount>0?`${totalPnl>=0?"+":""}${totalPnl.toFixed(2)}%`:"—"} color={totalPnl>=0?"#16a34a":"#dc2626"}/>
-          <StatCard label="RR Mode"      value={rrMode} color="#6366f1"/>
+          <StatCard label="RR Mode"      value={rrMode === "swing" ? "Swing SL/TP" : rrMode} color="#6366f1"/>
           <StatCard label="Timeframe"    value={timeframe.toUpperCase()} color="#0891b2"/>
         </div>
       )}
